@@ -123,6 +123,10 @@ struct App {
     ti_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
     ti_entered: bool,
+    /// enter 事件携带的焦点 surface（光标坐标换算用）
+    ti_surface: Option<WlSurface>,
+    /// 本轮 done 周期内是否收到过 preedit_string
+    ti_preedit_pending: bool,
     /// 双击检测：上次左键按下的时间与位置
     last_press: Option<(Instant, (f64, f64))>,
     /// 状态感知冷却
@@ -1211,6 +1215,22 @@ impl App {
         }
     }
 
+    /// 向 IME 报告光标矩形（候选框跟随），surface-local 坐标
+    fn ti_update_cursor(&mut self) {
+        let (Some(ti), Some(chat)) = (&self.text_input, &self.chat) else { return };
+        let Some(font) = &self.font else { return };
+        let (gx, gy, w, h) = chat.cursor_global(font);
+        // 焦点 surface 的原点偏移（全局 → surface-local）
+        let local = self
+            .ti_surface
+            .as_ref()
+            .and_then(|s| self.surfaces.iter().find(|ps| ps.wl_surface == *s))
+            .map(|ps| (gx - ps.origin.0, gy - ps.origin.1, w, h))
+            .unwrap_or((gx, gy, w, h));
+        ti.set_cursor_rectangle(local.0, local.1, local.2, local.3);
+        ti.commit();
+    }
+
     fn ti_disable(&mut self) {
         if let Some(ti) = &self.text_input {
             ti.disable();
@@ -1219,6 +1239,7 @@ impl App {
         if let Some(c) = &mut self.chat {
             c.preedit.clear();
         }
+        self.ti_preedit_pending = false;
     }
 
     /// 提交聊天输入
@@ -1254,6 +1275,7 @@ impl App {
             KS_ESCAPE => self.close_chat(),
             KS_BACKSPACE => {
                 self.chat.as_mut().unwrap().input.pop();
+                self.ti_update_cursor();
                 self.needs_redraw = true;
             }
             _ if !self.ti_active() => {
@@ -1261,6 +1283,7 @@ impl App {
                 if let Some(u) = &event.utf8 {
                     if !u.chars().any(|c| c.is_control()) {
                         self.chat.as_mut().unwrap().input.push_str(u);
+                        self.ti_update_cursor();
                         self.needs_redraw = true;
                     }
                 }
@@ -1396,8 +1419,9 @@ impl Dispatch<ZwpTextInputV3, ()> for App {
         _: &QueueHandle<App>,
     ) {
         match event {
-            zwp_text_input_v3::Event::Enter { .. } => {
+            zwp_text_input_v3::Event::Enter { surface } => {
                 data.ti_entered = true;
+                data.ti_surface = Some(surface);
                 if data.chat.is_some() {
                     data.ti_enable();
                 }
@@ -1413,12 +1437,27 @@ impl Dispatch<ZwpTextInputV3, ()> for App {
                         data.needs_redraw = true;
                     }
                 }
+                data.ti_update_cursor();
             }
             zwp_text_input_v3::Event::PreeditString { text, .. } => {
+                data.ti_preedit_pending = true;
                 if let Some(chat) = &mut data.chat {
                     chat.preedit = text.unwrap_or_default();
                     data.needs_redraw = true;
                 }
+                data.ti_update_cursor();
+            }
+            // done 是一轮更新结束：本轮无 preedit_string 则清空缓存（防拼音残留）
+            zwp_text_input_v3::Event::Done { .. } => {
+                if !data.ti_preedit_pending {
+                    if let Some(chat) = &mut data.chat {
+                        if !chat.preedit.is_empty() {
+                            chat.preedit.clear();
+                            data.needs_redraw = true;
+                        }
+                    }
+                }
+                data.ti_preedit_pending = false;
             }
             _ => {}
         }
@@ -1576,6 +1615,8 @@ fn main() -> Result<()> {
         ti_manager,
         text_input: None,
         ti_entered: false,
+        ti_surface: None,
+        ti_preedit_pending: false,
         last_press: None,
         last_sense: Instant::now() - std::time::Duration::from_secs(120),
         sense_acc: 0.0,

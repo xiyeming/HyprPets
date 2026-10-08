@@ -64,6 +64,25 @@ impl Chat {
         }
     }
 
+    /// 输入光标的全局矩形（供 IME set_cursor_rectangle 定位候选框）
+    pub fn cursor_global(&self, font: &FontKit) -> (i32, i32, i32, i32) {
+        let (x, y, w, h) = self.rect;
+        let input_h = 26;
+        let iy = y + h as i32 - input_h - PAD;
+        let text = if self.preedit.is_empty() {
+            self.input.clone()
+        } else {
+            format!("{}{}", self.input, self.preedit)
+        };
+        let text_max = w as i32 - PAD * 2 - 14;
+        let mut display: &str = &text;
+        while font.text_width(display).round() as i32 > text_max && !display.is_empty() {
+            display = &display[1..];
+        }
+        let tw = font.text_width(display).round() as i32;
+        (x + PAD + 6 + tw, iy, 2, font.px() as i32)
+    }
+
     /// 跟随宠物移动更新位置（保留内容与输入）
     pub fn follow(&mut self, anchor: (i32, i32), pet_w: i32, pet_h: i32, bbox: (i32, i32, i32, i32)) {
         self.rect = Self::layout_rect(anchor, pet_w, pet_h, bbox);
