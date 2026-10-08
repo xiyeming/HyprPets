@@ -43,11 +43,11 @@ impl Pet {
         self.h as i32 * self.scale as i32
     }
 
-    /// 把宠物位置钳制在屏幕内
-    pub fn clamp_to(&mut self, surface_w: u32, surface_h: u32) {
-        let max_x = (surface_w as i32 - self.width_px()).max(0);
-        let max_y = (surface_h as i32 - self.height_px()).max(0);
-        self.x = self.x.clamp(0, max_x);
-        self.y = self.y.clamp(0, max_y);
+    /// 把宠物位置钳制在联合包围盒内（多显示器布局）
+    pub fn clamp_to(&mut self, min_x: i32, min_y: i32, max_x: i32, max_y: i32) {
+        let x = self.x.clamp(min_x, (max_x - self.width_px()).max(min_x));
+        let y = self.y.clamp(min_y, (max_y - self.height_px()).max(min_y));
+        self.x = x;
+        self.y = y;
     }
 }

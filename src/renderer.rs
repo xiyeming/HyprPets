@@ -40,13 +40,15 @@ impl Renderer {
 
     /// 绘制一帧并提交到 surface。
     ///
-    /// `draw` 收到 u32 像素视图（0xAARRGGBB，长度 = width*height）。
+    /// `viewport` 是该 surface 在全局布局中的原点（多显示器坐标换算用），
+    /// `draw` 收到 u32 像素视图（0xAARRGGBB，长度 = width*height）、行宽与 viewport。
     pub fn present(
         &mut self,
         surface: &WlSurface,
         width: u32,
         height: u32,
-        draw: impl FnOnce(&mut [u32], usize),
+        viewport: (i32, i32),
+        draw: impl FnOnce(&mut [u32], usize, (i32, i32)),
     ) -> Result<()> {
         if self.size != (width, height) {
             self.ensure_pool(width, height);
@@ -64,7 +66,7 @@ impl Renderer {
 
         let pixels = u32_view(canvas);
         pixels.fill(0); // 全透明背景
-        draw(pixels, width as usize);
+        draw(pixels, width as usize, viewport);
 
         buffer
             .attach_to(surface)

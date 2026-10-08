@@ -6,9 +6,10 @@ Hyprland 像素桌面宠物（Rust + Wayland layer-shell）。
 
 ## 当前状态（Phase 1 ✅）
 
-- [x] `wlr-layer-shell` Overlay 层全屏 surface（跨 workspace 可见，多显示器由 compositor 分配）
-- [x] wl_shm 软件渲染管道，nearest 采样像素缩放（1x/2x/4x/8x），无模糊
-- [x] 鼠标拖拽移动（拖拽时自动扩大 input region 防断拖）
+- [x] `wlr-layer-shell` Overlay 层全屏 surface（跨 workspace 可见）
+- [x] **多显示器**：每屏一个 surface + 全局布局坐标，可自由拖过屏幕边界；显示器热插拔自动增删
+- [x] wl_shm 软件渲染管道，nearest 采样像素缩放（1x/2x/4x/8x），无模糊，跨屏自动裁剪
+- [x] 鼠标拖拽移动（拖拽时所有屏幕 input region 扩全屏，跨屏不断流）
 - [x] 穿透模式切换（SIGUSR1），穿透时宠物降至 40% 不透明度作视觉反馈
 - [x] 默认贴图自动生成（`~/.config/hyprpet/pet.png`，32x32 像素小猫）
 - [x] 内存占用 ~17MB（含 3 帧全屏 shm buffer）
@@ -55,8 +56,9 @@ src/
 
 关键设计：
 
-- **全屏 surface + 内部坐标**：宠物移动只是改内部坐标重绘，零 Wayland 协议开销、无窗口闪烁
-- **input region 三态**：常态 = 宠物 bbox；拖拽 = 全屏（防指针脱离断拖）；穿透 = 空 region
+- **每显示器一个全屏 surface + 全局布局坐标**：宠物移动只是改全局坐标重绘，跨屏时在各 surface 上按视口裁剪绘制，零窗口管理开销、无闪烁
+- **input region 三态**：常态 = 宠物 bbox 与各屏求交；拖拽 = 所有屏幕全屏（跨屏拖动指针不断流）；穿透 = 空 region
+- **显示器生命周期**：`new_output` 建 surface、`update_output` 同步 xdg-output 逻辑原点、`output_destroyed` 移除
 - **calloop `run` 语义**：`dispatch(None)` 无事件时阻塞，callback 只在事件后执行 —— 初始帧在进入主循环前手动 flush（`on_idle`）
 
 ## 路线图

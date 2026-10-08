@@ -58,21 +58,40 @@ impl Sprite {
         Ok(sprite)
     }
 
-    /// 把 sprite 以 nearest 采样绘制到全屏 buffer 上。
+    /// 把 sprite 以 nearest 采样绘制到某个显示器的 buffer 上。
+    ///
+    /// `viewport` 是该 surface 在全局布局中的原点，宠物坐标为全局坐标，
+    /// 可能整体或部分位于本 surface 之外（双向裁剪）。
     /// 穿透模式下整体降到 40% 不透明度作为视觉反馈。
-    pub fn blit(&self, buf: &mut [u32], buf_w: usize, pet: &Pet) {
-        let scale = pet.scale as usize;
-        let dim = pet.passthrough;
-        let buf_h = buf.len() / buf_w;
-        let (ox, oy) = (pet.x.max(0) as usize, pet.y.max(0) as usize);
+    pub fn blit(&self, buf: &mut [u32], buf_w: usize, viewport: (i32, i32), pet: &Pet) {
+        let scale = pet.scale as i32;
+        let pw = self.width as i32 * scale;
+        let ph = self.height as i32 * scale;
+        let buf_h = (buf.len() / buf_w) as i32;
 
-        for sy in 0..self.height as usize {
-            let dy0 = oy + sy * scale;
-            if dy0 >= buf_h {
-                break;
-            }
-            for sx in 0..self.width as usize {
-                let mut c = self.pixels[sy * self.width as usize + sx];
+        // 宠物在 buffer 局部坐标中的位置
+        let px = pet.x - viewport.0;
+        let py = pet.y - viewport.1;
+
+        // 与 buffer 的可见交集
+        let vx0 = px.max(0);
+        let vy0 = py.max(0);
+        let vx1 = (px + pw).min(buf_w as i32);
+        let vy1 = (py + ph).min(buf_h);
+        if vx0 >= vx1 || vy0 >= vy1 {
+            return;
+        }
+
+        // 映射回 sprite 像素坐标（起点向上对齐到 scale 边界，终点向下对齐）
+        let sx0 = (vx0 - px + scale - 1) / scale;
+        let sy0 = (vy0 - py + scale - 1) / scale;
+        let sx1 = (vx1 - px) / scale;
+        let sy1 = (vy1 - py) / scale;
+
+        let dim = pet.passthrough;
+        for sy in sy0..sy1 {
+            for sx in sx0..sx1 {
+                let mut c = self.pixels[sy as usize * self.width as usize + sx as usize];
                 let a = (c >> 24) & 0xff;
                 if a == 0 {
                     continue;
@@ -84,14 +103,12 @@ impl Sprite {
                         | ((((c >> 8) & 0xff) * 2 / 5) << 8)
                         | ((c & 0xff) * 2 / 5);
                 }
-                let dx0 = ox + sx * scale;
-                if dx0 >= buf_w {
-                    break;
-                }
-                for dy in 0..scale {
-                    let row = (dy0 + dy) * buf_w;
-                    for dx in 0..scale {
-                        buf[row + dx0 + dx] = c;
+                let bx = (px + sx * scale) as usize;
+                let by = (py + sy * scale) as usize;
+                for dy in 0..scale as usize {
+                    let row = (by + dy) * buf_w;
+                    for dx in 0..scale as usize {
+                        buf[row + bx + dx] = c;
                     }
                 }
             }
