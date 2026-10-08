@@ -52,7 +52,9 @@ use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{delegate_noop, Connection, QueueHandle};
+use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
+use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{self, ZwpTextInputV3};
 
 use crate::agent::{AgentEvent, AgentRequest};
 use crate::assets::Character;
@@ -117,6 +119,10 @@ struct App {
     chat: Option<Chat>,
     agent_tx: Option<std::sync::mpsc::Sender<AgentRequest>>,
     timers: Vec<(Instant, String)>,
+    /// text-input-v3（IME 输入）
+    ti_manager: Option<ZwpTextInputManagerV3>,
+    text_input: Option<ZwpTextInputV3>,
+    ti_entered: bool,
     /// 双击检测：上次左键按下的时间与位置
     last_press: Option<(Instant, (f64, f64))>,
     /// 状态感知冷却
@@ -800,6 +806,14 @@ impl App {
         }
 
 
+        // 对话框跟随宠物移动
+        if moved && self.chat.is_some() {
+            let bbox = self.layout_bbox();
+            if let (Some(c), Some(b)) = (&mut self.chat, bbox) {
+                c.follow((self.pet.x, self.pet.y), self.pet.width_px(), self.pet.height_px(), b);
+            }
+        }
+
         if moved {
             self.region_dirty = true;
             self.needs_redraw = true;
@@ -1083,6 +1097,9 @@ impl SeatHandler for App {
                 Ok(kbd) => self.keyboard = Some(kbd),
                 Err(e) => eprintln!("[hyprpet] 获取 keyboard 失败: {e}"),
             }
+            if let Some(m) = &self.ti_manager {
+                self.text_input = Some(m.get_text_input(&seat, qh, ()));
+            }
         }
     }
 
@@ -1182,31 +1199,74 @@ impl KeyboardHandler for App {
 }
 
 impl App {
-    fn on_key_press(&mut self, event: &KeyEvent) {
-        let Some(chat) = &mut self.chat else { return };
-        let keysym = event.keysym;
-        let code: u32 = keysym.into();
-        if code == KS_RETURN {
-            let text = std::mem::take(&mut chat.input);
-            if !text.trim().is_empty() {
-                chat.push(Who::User, &text);
-                chat.busy = true;
-                if let Some(tx) = &self.agent_tx {
-                    let _ = tx.send(AgentRequest::Chat(text));
-                }
+    /// text-input-v3 是否已就绪（IME 文本走 commit_string 路径）
+    fn ti_active(&self) -> bool {
+        self.ti_entered && self.text_input.is_some()
+    }
+
+    fn ti_enable(&mut self) {
+        if let Some(ti) = &self.text_input {
+            ti.enable();
+            ti.commit();
+        }
+    }
+
+    fn ti_disable(&mut self) {
+        if let Some(ti) = &self.text_input {
+            ti.disable();
+            ti.commit();
+        }
+        if let Some(c) = &mut self.chat {
+            c.preedit.clear();
+        }
+    }
+
+    /// 提交聊天输入
+    fn submit_chat(&mut self) {
+        let text = self
+            .chat
+            .as_mut()
+            .map(|c| {
+                let t = std::mem::take(&mut c.input);
+                c.preedit.clear();
+                t
+            })
+            .unwrap_or_default();
+        if !text.trim().is_empty() {
+            if let Some(c) = &mut self.chat {
+                c.push(Who::User, &text);
+                c.busy = true;
             }
-        } else if code == KS_ESCAPE {
-            self.close_chat();
-            return;
-        } else if code == KS_BACKSPACE {
-            chat.input.pop();
-        } else if let Some(u) = &event.utf8 {
-            // 忽略控制组合键产生的文本
-            if !u.chars().any(|c| c.is_control()) {
-                chat.input.push_str(u);
+            if let Some(tx) = &self.agent_tx {
+                let _ = tx.send(AgentRequest::Chat(text));
             }
         }
         self.needs_redraw = true;
+    }
+
+    fn on_key_press(&mut self, event: &KeyEvent) {
+        if self.chat.is_none() {
+            return;
+        }
+        let code: u32 = event.keysym.into();
+        match code {
+            KS_RETURN => self.submit_chat(),
+            KS_ESCAPE => self.close_chat(),
+            KS_BACKSPACE => {
+                self.chat.as_mut().unwrap().input.pop();
+                self.needs_redraw = true;
+            }
+            _ if !self.ti_active() => {
+                // 无 IME：物理按键文本直接输入；IME 激活时文本由 commit_string 提供
+                if let Some(u) = &event.utf8 {
+                    if !u.chars().any(|c| c.is_control()) {
+                        self.chat.as_mut().unwrap().input.push_str(u);
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn open_chat(&mut self) {
@@ -1227,6 +1287,10 @@ impl App {
             s.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
             s.wl_surface.commit();
         }
+        // 焦点已就绪（ti_entered）则直接启用 IME；否则等 enter 事件
+        if self.ti_entered {
+            self.ti_enable();
+        }
         self.region_dirty = true;
         self.needs_redraw = true;
     }
@@ -1236,6 +1300,7 @@ impl App {
             return;
         }
         self.chat = None;
+        self.ti_disable();
         for s in &self.surfaces {
             s.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
             s.wl_surface.commit();
@@ -1320,6 +1385,47 @@ impl LayerShellHandler for App {
         self.needs_redraw = true;
     }
 }
+
+impl Dispatch<ZwpTextInputV3, ()> for App {
+    fn event(
+        data: &mut App,
+        _: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { .. } => {
+                data.ti_entered = true;
+                if data.chat.is_some() {
+                    data.ti_enable();
+                }
+            }
+            zwp_text_input_v3::Event::Leave { .. } => {
+                data.ti_entered = false;
+                data.ti_disable();
+            }
+            zwp_text_input_v3::Event::CommitString { text } => {
+                if let (Some(chat), Some(t)) = (&mut data.chat, text) {
+                    if !t.is_empty() {
+                        chat.input.push_str(&t);
+                        data.needs_redraw = true;
+                    }
+                }
+            }
+            zwp_text_input_v3::Event::PreeditString { text, .. } => {
+                if let Some(chat) = &mut data.chat {
+                    chat.preedit = text.unwrap_or_default();
+                    data.needs_redraw = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(App: ignore ZwpTextInputManagerV3);
 
 delegate_compositor!(App);
 delegate_output!(App);
@@ -1446,6 +1552,9 @@ fn main() -> Result<()> {
     let shm_state = Shm::bind(&globals, &qh)?;
     let registry_state = RegistryState::new(&globals);
     let layer_shell = LayerShell::bind(&globals, &qh)?;
+    let ti_manager = globals
+        .bind::<ZwpTextInputManagerV3, App, ()>(&qh, 1..=1, ())
+        .ok();
 
     let mut app = App {
         qh: qh.clone(),
@@ -1464,6 +1573,9 @@ fn main() -> Result<()> {
         chat: None,
         agent_tx: None,
         timers: Vec::new(),
+        ti_manager,
+        text_input: None,
+        ti_entered: false,
         last_press: None,
         last_sense: Instant::now() - std::time::Duration::from_secs(120),
         sense_acc: 0.0,

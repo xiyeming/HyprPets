@@ -993,6 +993,7 @@ dependencies = [
  "tokio",
  "toml",
  "wayland-client",
+ "wayland-protocols",
  "zbus",
 ]
 

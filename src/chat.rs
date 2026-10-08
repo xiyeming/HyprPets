@@ -29,13 +29,20 @@ pub struct Chat {
     pub rect: (i32, i32, u32, u32),
     pub history: Vec<(Who, String)>,
     pub input: String,
+    /// IME 预编辑文本（未提交，仅展示）
+    pub preedit: String,
     pub busy: bool,
     cursor_on: bool,
 }
 
 impl Chat {
-    pub fn new(anchor: (i32, i32), pet_w: i32, pet_h: i32, bbox: (i32, i32, i32, i32)) -> Chat {
-        // 默认在宠物上方居中；放不下则下方
+    /// 计算对话框位置：优先宠物上方，空间不足则下方（钳制在显示器内）
+    pub fn layout_rect(
+        anchor: (i32, i32),
+        pet_w: i32,
+        pet_h: i32,
+        bbox: (i32, i32, i32, i32),
+    ) -> (i32, i32, u32, u32) {
         let mut x = anchor.0 + pet_w / 2 - CHAT_W as i32 / 2;
         x = x.clamp(bbox.0, (bbox.2 - CHAT_W as i32).max(bbox.0));
         let mut y = anchor.1 - CHAT_H as i32 - 12;
@@ -43,13 +50,23 @@ impl Chat {
             y = anchor.1 + pet_h + 12;
         }
         y = y.clamp(bbox.1, (bbox.3 - CHAT_H as i32).max(bbox.1));
+        (x, y, CHAT_W, CHAT_H)
+    }
+
+    pub fn new(anchor: (i32, i32), pet_w: i32, pet_h: i32, bbox: (i32, i32, i32, i32)) -> Chat {
         Chat {
-            rect: (x, y, CHAT_W, CHAT_H),
+            rect: Self::layout_rect(anchor, pet_w, pet_h, bbox),
             history: Vec::new(),
             input: String::new(),
+            preedit: String::new(),
             busy: false,
             cursor_on: true,
         }
+    }
+
+    /// 跟随宠物移动更新位置（保留内容与输入）
+    pub fn follow(&mut self, anchor: (i32, i32), pet_w: i32, pet_h: i32, bbox: (i32, i32, i32, i32)) {
+        self.rect = Self::layout_rect(anchor, pet_w, pet_h, bbox);
     }
 
     pub fn push(&mut self, who: Who, text: &str) {
@@ -142,14 +159,22 @@ impl Chat {
         fill_rect(buf, buf_w, viewport, (x + PAD, iy, inner_w as u32, input_h as u32), INPUT_BG);
         stroke_rect(buf, buf_w, viewport, (x + PAD, iy, inner_w as u32, input_h as u32), BORDER);
 
-        let shown: String = self.input.chars().collect();
+        // 输入 + IME 预编辑（预编辑用暗色表示未提交）
+        let shown = if self.preedit.is_empty() {
+            self.input.clone()
+        } else {
+            format!("{}{}", self.input, self.preedit)
+        };
         let text_max = inner_w - 14;
-        // 简单尾部裁剪
-        let mut display = shown.as_str();
+        let mut display: &str = &shown;
         while font.text_width(display).round() as i32 > text_max && !display.is_empty() {
             display = &display[1..];
         }
-        font.draw_text(buf, buf_w, viewport, x + PAD + 6, iy + 6, display, TEXT);
+        let input_len = self.input.chars().count().min(display.chars().count());
+        let (disp_input, disp_pre) = display.split_at(display.char_indices().nth(input_len).map(|(i, _)| i).unwrap_or(display.len()));
+        font.draw_text(buf, buf_w, viewport, x + PAD + 6, iy + 6, disp_input, TEXT);
+        let iw = font.text_width(disp_input).round() as i32;
+        font.draw_text(buf, buf_w, viewport, x + PAD + 6 + iw, iy + 6, disp_pre, ui::TEXT_DIM);
         if self.cursor_on {
             let cw = font.text_width(display).round() as i32;
             fill_rect(buf, buf_w, viewport, (x + PAD + 6 + cw, iy + 5, 2, (input_h - 10) as u32), CURSOR);
