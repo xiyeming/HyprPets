@@ -19,6 +19,8 @@ serde_json = "1"
 notify = "8"
 fontdb = "0.16"
 fontdue = "0.9"
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+rodio = { version = "0.21", default-features = false, features = ["playback", "wav"] }
 
 [profile.release]
 opt-level = 2

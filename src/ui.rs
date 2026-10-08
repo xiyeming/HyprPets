@@ -197,7 +197,7 @@ impl Menu {
                 frame,
                 (mx + BORDER + ITEM_PAD, ry + ITEM_PAD),
                 PREVIEW_SCALE,
-                false,
+                255,
             );
             // 名称
             let text_x = mx + BORDER + ITEM_PAD + entry.preview.frame_w as i32 * PREVIEW_SCALE as i32 + 8;
@@ -232,4 +232,72 @@ pub fn stroke_rect(buf: &mut [u32], buf_w: usize, viewport: (i32, i32), rect: (i
     fill_rect(buf, buf_w, viewport, (x, y + h as i32 - 1, w, 1), color);
     fill_rect(buf, buf_w, viewport, (x, y, 1, h), color);
     fill_rect(buf, buf_w, viewport, (x + w as i32 - 1, y, 1, h), color);
+}
+
+// ---------- 通知气泡 ----------
+
+pub struct Bubble {
+    pub text: String,
+    pub until: std::time::Instant,
+}
+
+impl Bubble {
+    /// 剩余时间 < 0.5s 时不透明度渐出
+    pub fn alpha(&self) -> u8 {
+        let remain = self.until.saturating_duration_since(std::time::Instant::now());
+        let ms = remain.as_millis() as u64;
+        if ms > 500 {
+            255
+        } else {
+            (ms * 255 / 500) as u8
+        }
+    }
+}
+
+const BUBBLE_BG: u32 = rgba(250, 252, 255, 242);
+const BUBBLE_BORDER: u32 = rgba(90, 95, 120, 255);
+const BUBBLE_TEXT: u32 = rgba(35, 38, 52, 255);
+
+/// 在宠物头顶绘制气泡（空间不足时放脚下）
+pub fn draw_bubble(
+    bubble: &Bubble,
+    font: &FontKit,
+    buf: &mut [u32],
+    buf_w: usize,
+    viewport: (i32, i32),
+    pet: (i32, i32, i32, i32), // x, y, w, h（全局）
+    monitor: (i32, i32, i32, i32),
+) {
+    let text: String = bubble.text.chars().take(24).collect();
+    let text_w = font.text_width(&text).round() as i32;
+    let pad = 8;
+    let bw = text_w + pad * 2 + 2;
+    let bh = font.px as i32 + pad + 4;
+
+    let (px, py, pw, ph) = pet;
+    let mut bx = (px + pw / 2 - bw / 2).clamp(monitor.0, monitor.2 - bw);
+    let above = py - bh - 10 >= monitor.1;
+    let by = if above { py - bh - 10 } else { py + ph + 10 };
+
+    // 面板 + 边框 + 尾巴
+    fill_rect(buf, buf_w, viewport, (bx, by, bw as u32, bh as u32), BUBBLE_BG);
+    stroke_rect(buf, buf_w, viewport, (bx, by, bw as u32, bh as u32), BUBBLE_BORDER);
+    let tail_x = (px + pw / 2).clamp(bx + 6, bx + bw - 10);
+    if above {
+        fill_rect(buf, buf_w, viewport, (tail_x, by + bh, 4, 3), BUBBLE_BG);
+        fill_rect(buf, buf_w, viewport, (tail_x + 1, by + bh + 3, 2, 2), BUBBLE_BG);
+    } else {
+        fill_rect(buf, buf_w, viewport, (tail_x, by - 3, 4, 3), BUBBLE_BG);
+        fill_rect(buf, buf_w, viewport, (tail_x + 1, by - 5, 2, 2), BUBBLE_BG);
+    }
+
+    font.draw_text(
+        buf,
+        buf_w,
+        viewport,
+        bx + pad + 1,
+        by + (bh - font.px as i32) / 2,
+        &text,
+        BUBBLE_TEXT,
+    );
 }

@@ -10,8 +10,10 @@
 //! - 渲染走 wl_shm SlotPool + nearest 采样，主线程事件循环（Wayland 要求）
 
 mod assets;
+mod audio;
 mod builtin_cat;
 mod fsm;
+mod hypr;
 mod pet;
 mod physics;
 mod renderer;
@@ -49,11 +51,13 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{delegate_noop, Connection, QueueHandle};
 
 use crate::assets::Character;
+use crate::audio::Audio;
 use crate::fsm::Fsm;
+use crate::hypr::{HyprSockets, WinCache};
 use crate::pet::Pet;
 use crate::physics::Physics;
 use crate::renderer::Renderer;
-use crate::ui::{FontKit, Menu, MenuEntry};
+use crate::ui::{Bubble, FontKit, Menu, MenuEntry};
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -62,6 +66,7 @@ const BTN_RIGHT: u32 = 0x111;
 enum ControlEvent {
     TogglePassthrough,
     Reload,
+    Notify(String),
     Quit,
 }
 
@@ -72,10 +77,12 @@ struct PetSurface {
     #[allow(dead_code)]
     layer: LayerSurface,
     wl_surface: WlSurface,
-    /// 该显示器在全局布局中的原点
+    /// 该显示器在全局布局中的原点（可见区域，已补偿 exclusive zone）
     origin: (i32, i32),
     /// surface 尺寸（= 显示器可用区域分辨率）
     size: (u32, u32),
+    /// 显示器名称（Hyprland monitor name，用于窗口匹配）
+    name: String,
     configured: bool,
 }
 
@@ -92,6 +99,14 @@ struct App {
     /// 保持文件监视器存活
     #[allow(dead_code)]
     watcher: Option<notify::RecommendedWatcher>,
+    /// Hyprland IPC（无则功能降级）
+    hypr: Option<HyprSockets>,
+    win_cache: WinCache,
+    /// 窗口缓存刷新防抖时间点
+    win_refresh_at: Option<Instant>,
+
+    audio: Audio,
+    bubble: Option<Bubble>,
 
     /// 每显示器一个全屏 surface
     surfaces: Vec<PetSurface>,
@@ -155,11 +170,16 @@ impl App {
         if self.surfaces.iter().any(|s| s.output == *output) {
             return;
         }
-        let origin = self
+        let (origin, mon_name) = self
             .output_state
             .info(output)
-            .map(|i| i.logical_position.unwrap_or(i.location))
-            .unwrap_or((0, 0));
+            .map(|i| {
+                (
+                    i.logical_position.unwrap_or(i.location),
+                    i.name.clone().unwrap_or_default(),
+                )
+            })
+            .unwrap_or(((0, 0), String::new()));
 
         let wl_surface = self.compositor_state.create_surface(&self.qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -181,9 +201,10 @@ impl App {
             wl_surface,
             origin,
             size: (0, 0),
+            name: mon_name.clone(),
             configured: false,
         });
-        eprintln!("[hyprpet] 新显示器 surface: origin=({},{})", origin.0, origin.1);
+        eprintln!("[hyprpet] 新显示器 surface: {} origin=({},{})", mon_name, origin.0, origin.1);
     }
 
     // ---------- 角色 ----------
@@ -250,20 +271,83 @@ impl App {
     }
 
     fn set_action(&mut self, name: &str) -> bool {
-        let Some(fsm) = &mut self.fsm else { return false };
-        if fsm.set(name) {
-            return true;
+        let switched = {
+            let Some(fsm) = &mut self.fsm else { return false };
+            if fsm.set(name) {
+                true
+            } else {
+                // 角色没有该动作时回落 idle
+                name != "idle" && fsm.set("idle")
+            }
+        };
+        if switched {
+            self.play_action_sound();
         }
-        // 角色没有该动作时回落 idle
-        name != "idle" && fsm.set("idle")
+        switched
+    }
+
+    fn play_action_sound(&self) {
+        let (Some(c), Some(fsm)) = (&self.character, &self.fsm) else { return };
+        let Some(def) = c.actions.get(&fsm.current) else { return };
+        if let Some(sound) = &def.sound {
+            self.audio.play(&c.dir.join(sound));
+        }
+    }
+
+    /// 宠物中心点所在显示器
+    fn monitor_of(&self, x: i32) -> Option<&PetSurface> {
+        self.surfaces
+            .iter()
+            .find(|s| s.configured && x >= s.origin.0 && x < s.origin.0 + s.size.0 as i32)
+    }
+
+    fn monitor_rect_of(&self, x: i32) -> Option<(i32, i32, i32, i32)> {
+        self.monitor_of(x).map(|m| {
+            (m.origin.0, m.origin.1, m.origin.0 + m.size.0 as i32, m.origin.1 + m.size.1 as i32)
+        })
+    }
+
+    /// 宠物 x 范围内的候选地板：显示器底缘 + 该显示器可见工作区的窗口顶缘
+    fn floors_at(&self, x0: i32, x1: i32) -> Vec<i32> {
+        let mut v = Vec::new();
+        let Some(mon) = self.monitor_of((x0 + x1) / 2) else { return v };
+        v.push(mon.origin.1 + mon.size.1 as i32);
+        for w in self.win_cache.visible_windows_on(&mon.name) {
+            if w.fullscreen > 0 {
+                continue;
+            }
+            if w.x < x1 && w.x + w.w > x0 {
+                v.push(w.y);
+            }
+        }
+        v.sort_unstable();
+        v
+    }
+
+    /// 地板状态：站立 / 下方有空可坠落 / 前方是墙（地板在上方）
+    fn floor_status(&self, x0: i32, x1: i32, y: i32) -> FloorStatus {
+        let floors = self.floors_at(x0, x1);
+        if let Some(&f) = floors.iter().find(|&&f| (f - y).abs() <= 4) {
+            return FloorStatus::OnFloor(f);
+        }
+        if let Some(&f) = floors.iter().find(|&&f| f > y + 4) {
+            return FloorStatus::Gap(f);
+        }
+        FloorStatus::Wall
+    }
+
+    /// 全屏避让：所在显示器有可见全屏窗口时淡出并暂停漫游
+    fn evading(&self) -> bool {
+        let cx = self.pet.x + self.pet.width_px() / 2;
+        self.monitor_of(cx)
+            .map(|m| self.win_cache.has_fullscreen_on(&m.name))
+            .unwrap_or(false)
     }
 
     // ---------- 菜单 ----------
 
     fn open_menu(&mut self) {
-        if self.font.is_none() {
-            self.font = FontKit::load();
-        }
+        self.ensure_font();
         let Some(font) = self.font.take() else {
             eprintln!("[hyprpet] 无可用系统字体，菜单不可用");
             return;
@@ -335,6 +419,21 @@ impl App {
         self.region_dirty = false;
     }
 
+    /// 懒加载系统字体（菜单/气泡共用）
+    fn ensure_font(&mut self) {
+        if self.font.is_none() {
+            self.font = FontKit::load();
+        }
+    }
+
+    fn on_notification(&mut self, summary: String) {
+        self.ensure_font();
+        self.bubble = Some(Bubble { text: summary, until: Instant::now() + std::time::Duration::from_secs(5) });
+        self.audio.play(&audio::sounds_dir().join("pop.wav"));
+        self.set_action("alert");
+        self.needs_redraw = true;
+    }
+
     fn toggle_passthrough(&mut self) {
         self.pet.passthrough = !self.pet.passthrough;
         self.region_dirty = true;
@@ -345,14 +444,18 @@ impl App {
     // ---------- 渲染 ----------
 
     fn redraw(&mut self) -> Result<()> {
-        let Some(renderer) = &mut self.renderer else {
-            return Ok(());
-        };
         let frame = self.fsm.as_ref().map(|f| f.frame()).unwrap_or(0);
         let sheet = self.character.as_ref().map(|c| &c.sheet);
         let menu = self.menu.as_ref();
+        let bubble = self.bubble.as_ref();
+        let font = self.font.as_ref();
+        let evade = self.evading();
         let pet = &self.pet;
         let debug_fill = self.debug_fill;
+        let mon_rect = self.monitor_rect_of(pet.x + pet.width_px() / 2);
+        let Some(renderer) = &mut self.renderer else {
+            return Ok(());
+        };
 
         for i in 0..self.surfaces.len() {
             let s = &self.surfaces[i];
@@ -367,9 +470,27 @@ impl App {
                         pixels.fill(c);
                         return;
                     }
+                    let alpha = if pet.passthrough {
+                        102
+                    } else if evade {
+                        64
+                    } else {
+                        255
+                    };
                     if let Some(sheet) = sheet {
                         let rect = sheet.frame(frame);
-                        sheet.blit_frame(pixels, buf_w, vp, rect, (pet.x, pet.y), pet.scale, pet.passthrough);
+                        sheet.blit_frame(pixels, buf_w, vp, rect, (pet.x, pet.y), pet.scale, alpha);
+                    }
+                    if let (Some(b), Some(f), Some(mr)) = (bubble, font, mon_rect) {
+                        ui::draw_bubble(
+                            b,
+                            f,
+                            pixels,
+                            buf_w,
+                            vp,
+                            (pet.x, pet.y, pet.width_px(), pet.height_px()),
+                            mr,
+                        );
                     }
                     if let Some(m) = menu {
                         m.draw(pixels, buf_w, vp);
@@ -400,20 +521,36 @@ impl App {
         self.last_tick = now;
 
         let Some(bbox) = self.layout_bbox() else { return };
-        let ground = self.ground_y(bbox);
         let mut moved = false;
         let mut animated = false;
 
         if self.physics.active {
-            // 抛掷/下落：重力积分
+            // 抛掷/下落：重力积分 + 地板穿越检测（可落在窗口顶缘）
+            let old_y = self.pet.y;
             self.pet.x = (self.pet.x as f32 + self.physics.vx * dt).round() as i32;
             self.pet.y = (self.pet.y as f32 + self.physics.vy * dt).round() as i32;
             self.physics.vy = (self.physics.vy + Physics::GRAVITY * dt).min(Physics::TERMINAL);
             moved = true;
-            self.pet.clamp_to(bbox.0, bbox.1, bbox.2, bbox.3);
-            if self.pet.y >= ground && self.physics.vy > 0.0 {
+            // 水平方向钳制在所在显示器内
+            if let Some(m) = self.monitor_rect_of(self.pet.x + self.pet.width_px() / 2) {
+                let max_x = m.2 - self.pet.width_px();
+                let nx = self.pet.x.clamp(m.0, max_x.max(m.0));
+                if nx != self.pet.x {
+                    self.pet.x = nx;
+                    self.physics.vx = 0.0;
+                }
+            }
+            // 地板穿越：旧位置之下、新位置之上的最高地板
+            let x0 = self.pet.x;
+            let x1 = x0 + self.pet.width_px();
+            let landed = self
+                .floors_at(x0, x1)
+                .into_iter()
+                .filter(|&f| f >= old_y - 1 && f <= self.pet.y)
+                .min();
+            if let Some(f) = landed {
                 let impact = self.physics.vy;
-                self.pet.y = ground;
+                self.pet.y = f;
                 self.physics.stop();
                 if impact > 700.0 {
                     self.set_action("land");
@@ -421,29 +558,95 @@ impl App {
                     self.set_action("idle");
                 }
                 animated = true;
+            } else {
+                self.pet.y = self.pet.y.min(bbox.3 - self.pet.height_px());
             }
         } else if self.drag_offset.is_none() {
-            // FSM 驱动的位移（行走）+ 贴地
             let def = self.fsm.as_ref().and_then(|f| f.def().cloned());
             if let Some(def) = def {
+                // 贴地（地板可能是窗口顶缘）
+                let x0 = self.pet.x;
+                let x1 = x0 + self.pet.width_px();
+                match self.floor_status(x0, x1, self.pet.y) {
+                    FloorStatus::OnFloor(f) => {
+                        if self.pet.y != f {
+                            self.pet.y = f;
+                            moved = true;
+                        }
+                    }
+                    FloorStatus::Gap(_) => {
+                        // 走出地板边缘 → 坠落
+                        self.physics.toss(0.0, 0.0);
+                        self.set_action("fall");
+                        animated = true;
+                    }
+                    FloorStatus::Wall => {
+                        // 被放置在墙沿上，保持现状
+                    }
+                }
+
+                // FSM 驱动的位移（行走）
                 if let Some([mx, my]) = def.movement {
-                    self.pet.x = (self.pet.x as f32 + mx * dt).round() as i32;
-                    self.pet.y = (self.pet.y as f32 + my * dt).round() as i32;
-                    moved = true;
-                    // 边界自动转向
-                    if def.auto_turn && (self.pet.x <= bbox.0 || self.pet.x + self.pet.width_px() >= bbox.2) {
-                        let current = self.fsm.as_ref().map(|f| f.current.clone()).unwrap_or_default();
-                        let mirrored = mirror_action(&current);
-                        if self.set_action(&mirrored) {
-                            animated = true;
+                    let evading = self.evading();
+                    if !evading {
+                        let old_x = self.pet.x;
+                        self.pet.x = (self.pet.x as f32 + mx * dt).round() as i32;
+                        self.pet.y = (self.pet.y as f32 + my * dt).round() as i32;
+                        moved = true;
+
+                        // 显示器边界 = 墙
+                        let mut hit_wall = false;
+                        if let Some(m) = self.monitor_rect_of(self.pet.x + self.pet.width_px() / 2) {
+                            let max_x = m.2 - self.pet.width_px();
+                            if self.pet.x < m.0 || self.pet.x > max_x {
+                                self.pet.x = self.pet.x.clamp(m.0, max_x.max(m.0));
+                                hit_wall = true;
+                            }
+                        } else if self.pet.x <= bbox.0 || self.pet.x + self.pet.width_px() >= bbox.2 {
+                            self.pet.clamp_to(bbox.0, bbox.1, bbox.2, bbox.3);
+                            hit_wall = true;
+                        }
+
+                        // 地板状态：走出边缘 → 坠落；撞窗口侧壁 → 转向
+                        match self.floor_status(self.pet.x, self.pet.x + self.pet.width_px(), self.pet.y) {
+                            FloorStatus::OnFloor(_) => {}
+                            FloorStatus::Gap(_) => {
+                                self.physics.toss(mx * 0.4, 0.0);
+                                self.set_action("fall");
+                            }
+                            FloorStatus::Wall => {
+                                self.pet.x = old_x;
+                                hit_wall = true;
+                            }
+                        }
+
+                        if (def.auto_turn && hit_wall) || (def.auto_turn && (self.pet.x <= bbox.0 || self.pet.x + self.pet.width_px() >= bbox.2)) {
+                            let current = self.fsm.as_ref().map(|f| f.current.clone()).unwrap_or_default();
+                            let mirrored = mirror_action(&current);
+                            if self.set_action(&mirrored) {
+                                animated = true;
+                            }
                         }
                     }
                 }
-                // 非拖拽/非物理时保持贴地（位置变化必须标记 moved，
-                // 否则 input region 停在旧位置导致无法再次抓取）
-                if self.pet.y != ground {
-                    self.pet.y = ground;
-                    moved = true;
+            }
+        }
+
+        // 气泡过期
+        if let Some(b) = &self.bubble {
+            if b.until <= now {
+                self.bubble = None;
+                self.needs_redraw = true;
+            }
+        }
+
+        // 窗口缓存防抖刷新
+        if let Some(t) = self.win_refresh_at {
+            if now >= t {
+                self.win_refresh_at = None;
+                if let Some(h) = &self.hypr {
+                    self.win_cache = h.refresh_cache();
+                    self.needs_redraw = true;
                 }
             }
         }
@@ -594,6 +797,16 @@ impl App {
     }
 }
 
+/// 地板状态
+enum FloorStatus {
+    /// 站立在地板 f 上
+    OnFloor(i32),
+    /// 下方最近地板 f（走出边缘）
+    Gap(i32),
+    /// 地板全在上方（窗口侧壁）
+    Wall,
+}
+
 /// walk_left ↔ walk_right 镜像命名
 fn mirror_action(name: &str) -> String {
     if let Some(base) = name.strip_suffix("_left") {
@@ -654,6 +867,9 @@ impl OutputHandler for App {
                     } else {
                         (ox, oy)
                     };
+                    if let Some(name) = &info.name {
+                        s.name = name.clone();
+                    }
                 }
             }
             self.place_pet_if_needed();
@@ -853,8 +1069,9 @@ fn parse_args() -> Args {
 fn main() -> Result<()> {
     let args = parse_args();
 
-    // 首次运行写入内置角色
+    // 首次运行写入内置角色与提示音
     let builtin_dir = assets::ensure_builtin_character().context("初始化内置角色失败")?;
+    audio::ensure_builtin_sounds();
 
     // 读取上次使用的角色
     let state_path = assets::characters_dir().join("state.toml");
@@ -893,6 +1110,11 @@ fn main() -> Result<()> {
         registry_state,
         layer_shell,
         watcher: None,
+        hypr: HyprSockets::connect(),
+        win_cache: WinCache::default(),
+        win_refresh_at: None,
+        audio: Audio::new(),
+        bubble: None,
         surfaces: Vec::new(),
         renderer: None,
         character: None,
@@ -934,8 +1156,106 @@ fn main() -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("注册定时器失败: {e:?}"))?;
 
-    // 信号 + 文件监视共用控制 channel
+    // 信号 + 文件监视 + 通知共用控制 channel
     let (tx, rx) = channel::channel::<ControlEvent>();
+
+    // Hyprland 事件 socket（Generic fd 源，可读时防抖刷新窗口缓存）
+    let mut event_buf = String::new();
+    if let Some(hypr) = &app.hypr {
+        use calloop::generic::Generic;
+        use calloop::{Interest, Mode};
+        use std::io::Read as _;
+        let generic = Generic::new(hypr.event_stream(), Interest::READ, Mode::Level);
+        if let Err(e) = event_loop.handle().insert_source(generic, move |_, stream, app| {
+            use calloop::PostAction;
+            let stream = unsafe { stream.get_mut() };
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => return Ok(PostAction::Continue),
+                    Ok(n) => {
+                        event_buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                        while let Some(pos) = event_buf.find('\n') {
+                            let line: String = event_buf[..pos].trim().to_string();
+                            event_buf.drain(..=pos);
+                            if hypr::event_triggers_refresh(&line) {
+                                app.win_refresh_at =
+                                    Some(Instant::now() + std::time::Duration::from_millis(150));
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Ok(PostAction::Continue)
+                    }
+                    Err(_) => return Ok(PostAction::Remove),
+                }
+            }
+        }) {
+            eprintln!("[hyprpet] 注册 Hyprland 事件源失败: {e:?}");
+        }
+        app.win_refresh_at = Some(Instant::now() + std::time::Duration::from_millis(50));
+    }
+
+    // DBus 系统通知监听（zbus blocking 线程）
+    std::thread::spawn({
+        let tx = tx.clone();
+        move || {
+            let conn = match zbus::blocking::Connection::session() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[hyprpet] DBus 会话连接失败，通知气泡禁用: {e}");
+                    return;
+                }
+            };
+            // BecomeMonitor：通知守护进程（quickshell/swaync 等）不广播 Notify 信号，
+            // 只能以总线监视模式窃听 method call。此后此连接只读。
+            let rules = vec!["type='method_call',member='Notify'".to_string()];
+            if let Err(e) = conn.call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus.Monitoring"),
+                "BecomeMonitor",
+                &(rules, 0u32),
+            ) {
+                eprintln!("[hyprpet] BecomeMonitor 失败（DBus 策略限制），通知气泡禁用: {e}");
+                return;
+            }
+            eprintln!("[hyprpet] 通知监听已启用（DBus monitor 模式）");
+            use zbus::blocking::MessageIterator;
+            let iter = match MessageIterator::for_match_rule(
+                zbus::MatchRule::builder().msg_type(zbus::message::Type::MethodCall).build(),
+                &conn,
+                None,
+            ) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("[hyprpet] 通知订阅失败: {e}");
+                    return;
+                }
+            };
+            type Hints = std::collections::HashMap<String, zbus::zvariant::OwnedValue>;
+            for msg in iter {
+                let Ok(msg) = msg else { continue };
+                let hdr = msg.header();
+                if hdr.interface().map(|i| i.as_str()) != Some("org.freedesktop.Notifications")
+                    || hdr.member().map(|m| m.as_str()) != Some("Notify")
+                {
+                    continue;
+                }
+                match msg
+                    .body()
+                    .deserialize::<(String, u32, String, String, String, Vec<String>, Hints, i32)>()
+                {
+                    Ok((_app, _id, _icon, summary, _body, _actions, _hints, _timeout)) => {
+                        if tx.send(ControlEvent::Notify(summary)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => eprintln!("[hyprpet] 通知解析失败: {e}"),
+                }
+            }
+        }
+    });
     std::thread::spawn({
         let tx = tx.clone();
         move || {
@@ -980,6 +1300,7 @@ fn main() -> Result<()> {
         .insert_source(rx, |ev, _, app| match ev {
             ChannelEvent::Msg(ControlEvent::TogglePassthrough) => app.toggle_passthrough(),
             ChannelEvent::Msg(ControlEvent::Reload) => app.pending_reload = true,
+            ChannelEvent::Msg(ControlEvent::Notify(summary)) => app.on_notification(summary),
             ChannelEvent::Msg(ControlEvent::Quit) | ChannelEvent::Closed => std::process::exit(0),
         })
         .map_err(|e| anyhow::anyhow!("注册信号事件源失败: {e:?}"))?;

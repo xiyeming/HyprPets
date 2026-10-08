@@ -51,6 +51,8 @@ pub struct ActionDef {
     pub next: Option<String>,
     #[serde(default)]
     pub next_random: Vec<String>,
+    /// 进入动作时播放的音效（相对角色目录）
+    pub sound: Option<String>,
 }
 
 fn default_fps() -> f32 {
@@ -81,6 +83,8 @@ struct ActionToml {
     next: Option<String>,
     #[serde(default)]
     next_random: Vec<String>,
+    /// 进入动作时播放的音效（相对角色目录）
+    sound: Option<String>,
     /// 网格 [col,row] 列表
     frames: Option<Vec<[u32; 2]>>,
     /// Aseprite 帧标签
@@ -111,6 +115,7 @@ impl ActionToml {
             auto_turn: self.auto_turn,
             next: self.next,
             next_random: self.next_random,
+            sound: self.sound,
         })
     }
 }
@@ -367,6 +372,13 @@ frames = [[4, 3]]
 fps = 8
 loop = false
 frames = [[5, 3]]
+next = "idle"
+
+# 系统通知提醒 → idle
+[actions.alert]
+fps = 6
+loop = false
+frames = [[2, 0], [3, 0]]
 next = "idle"
 
 # 被点击（开心）→ idle

@@ -139,11 +139,12 @@ mod tests {
                 auto_turn: false,
                 next: None,
                 next_random: vec!["blink".into()],
+                sound: None,
             },
         );
         m.insert(
             "blink".into(),
-            ActionDef { fps: 2.0, frames: vec![2], r#loop: false, movement: None, auto_turn: false, next: Some("idle".into()), next_random: vec![], duration: None },
+            ActionDef { fps: 2.0, frames: vec![2], r#loop: false, movement: None, auto_turn: false, next: Some("idle".into()), next_random: vec![], duration: None, sound: None },
         );
         m
     }

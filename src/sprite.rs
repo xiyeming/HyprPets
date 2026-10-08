@@ -81,7 +81,7 @@ impl Sheet {
     /// 把某一帧以 nearest 采样绘制到某个显示器的 buffer 上。
     ///
     /// `viewport` 是该 surface 在全局布局中的原点，`dst` 是帧左上角全局坐标。
-    /// 穿透模式（dim）整体降到 40% 不透明度。
+    /// `alpha` 为整体不透明度（255 = 不透明；穿透 102、全屏避让 64）。
     #[allow(clippy::too_many_arguments)]
     pub fn blit_frame(
         &self,
@@ -91,7 +91,7 @@ impl Sheet {
         frame: FrameRect,
         dst: (i32, i32),
         scale: u32,
-        dim: bool,
+        alpha: u8,
     ) {
         let scale = scale as i32;
         if scale <= 0 {
@@ -128,11 +128,12 @@ impl Sheet {
                 if a == 0 {
                     continue;
                 }
-                if dim {
-                    c = (((c >> 24) & 0xff) * 2 / 5) << 24
-                        | ((((c >> 16) & 0xff) * 2 / 5) << 16)
-                        | ((((c >> 8) & 0xff) * 2 / 5) << 8)
-                        | ((c & 0xff) * 2 / 5);
+                if alpha < 255 {
+                    let a = alpha as u32;
+                    c = (((c >> 24) & 0xff) * a / 255) << 24
+                        | ((((c >> 16) & 0xff) * a / 255) << 16)
+                        | ((((c >> 8) & 0xff) * a / 255) << 8)
+                        | (((c & 0xff) * a / 255));
                 }
                 let bx = (px + sx * scale) as usize;
                 let by = (py + sy * scale) as usize;
