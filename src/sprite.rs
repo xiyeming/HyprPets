@@ -1,103 +1,134 @@
-//! Sprite 加载与像素合成。
+//! Sprite 图集（多帧动画表）与像素合成。
 //!
-//! 像素格式为预乘 ARGB（0xAARRGGBB），与 softbuffer / wl_shm ARGB8888 一致。
-//! 加载时做预乘，合成时逐像素 nearest 放大。
+//! 像素格式为预乘 ARGB（0xAARRGGBB），与 wl_shm Argb8888 小端布局一致。
+//! 帧源支持两种：
+//! - 网格表：`frames` 按行优先索引（col,row → idx = row*cols + col），帧尺寸一致
+//! - Aseprite 导出：每帧独立矩形（`Sheet::frames` 为任意矩形列表）
+//!
+//! 合成时逐像素 nearest 放大，双向裁剪（宠物可部分在屏外/跨屏）。
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::pet::Pet;
+/// 帧矩形（像素，整张图内）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
 
-pub struct Sprite {
+pub struct Sheet {
     pub width: u32,
     pub height: u32,
     /// 预乘 ARGB 像素
     pixels: Vec<u32>,
+    /// 帧矩形列表（网格格式为所有单元格，Aseprite 为导出帧）
+    pub frames: Vec<FrameRect>,
+    /// 网格列数（Aseprite 格式为 0）
+    pub cols: u32,
+    pub frame_w: u32,
+    pub frame_h: u32,
 }
 
-impl Sprite {
-    /// 从 PNG 加载；文件不存在时生成一只默认像素小猫并落盘。
-    pub fn load_or_default(path: &Path) -> Result<Sprite> {
-        if path.exists() {
-            let img = image::open(path)
-                .with_context(|| format!("无法读取贴图 {}", path.display()))?
-                .to_rgba8();
-            let (w, h) = img.dimensions();
-            let pixels = img
-                .pixels()
-                .map(|p| {
-                    let [r, g, b, a] = p.0;
-                    let r = ((r as u32 * a as u32) / 255) as u8;
-                    let g = ((g as u32 * a as u32) / 255) as u8;
-                    let b = ((b as u32 * a as u32) / 255) as u8;
-                    ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
-                })
-                .collect();
-            return Ok(Sprite { width: w, height: h, pixels });
+impl Sheet {
+    /// 网格表：整图 + 帧尺寸，frames 按行优先生成
+    pub fn grid(pixels: Vec<u32>, width: u32, height: u32, frame_w: u32, frame_h: u32) -> Sheet {
+        let cols = width / frame_w;
+        let rows = height / frame_h;
+        let mut frames = Vec::with_capacity((cols * rows) as usize);
+        for row in 0..rows {
+            for col in 0..cols {
+                frames.push(FrameRect { x: col * frame_w, y: row * frame_h, w: frame_w, h: frame_h });
+            }
         }
-
-        let sprite = default_cat();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        let mut img = image::RgbaImage::new(sprite.width, sprite.height);
-        for (i, p) in sprite.pixels.iter().enumerate() {
-            // 注意：必须先提升到 u32 再做乘法，u8*255 会溢出回绕
-            let a = (p >> 24) as u8;
-            let unpremul = |v: u32| -> u8 {
-                if a > 0 { ((v * 255) / a as u32) as u8 } else { 0 }
-            };
-            let r = unpremul((p >> 16) & 0xff);
-            let g = unpremul((p >> 8) & 0xff);
-            let b = unpremul(p & 0xff);
-            img.put_pixel(i as u32 % sprite.width, i as u32 / sprite.width, image::Rgba([r, g, b, a]));
-        }
-        img.save(path).with_context(|| format!("无法写入默认贴图 {}", path.display()))?;
-        Ok(sprite)
+        Sheet { width, height, pixels, frames, cols, frame_w, frame_h }
     }
 
-    /// 把 sprite 以 nearest 采样绘制到某个显示器的 buffer 上。
+    /// Aseprite 表：整图 + 显式帧矩形
+    pub fn aseprite(pixels: Vec<u32>, width: u32, height: u32, frames: Vec<FrameRect>) -> Sheet {
+        let frame_w = frames.first().map(|f| f.w).unwrap_or(width);
+        let frame_h = frames.first().map(|f| f.h).unwrap_or(height);
+        Sheet { width, height, pixels, frames, cols: 0, frame_w, frame_h }
+    }
+
+    /// 从 PNG 加载整图像素（预乘）
+    pub fn load_pixels(path: &Path) -> Result<(Vec<u32>, u32, u32)> {
+        let img = image::open(path)
+            .with_context(|| format!("无法读取贴图 {}", path.display()))?
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        let pixels = img
+            .pixels()
+            .map(|p| {
+                let [r, g, b, a] = p.0;
+                let r = ((r as u32 * a as u32) / 255) as u8;
+                let g = ((g as u32 * a as u32) / 255) as u8;
+                let b = ((b as u32 * a as u32) / 255) as u8;
+                ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+            })
+            .collect();
+        Ok((pixels, w, h))
+    }
+
+    pub fn frame(&self, idx: usize) -> FrameRect {
+        self.frames.get(idx).copied().unwrap_or(FrameRect { x: 0, y: 0, w: self.frame_w, h: self.frame_h })
+    }
+
+    /// 把某一帧以 nearest 采样绘制到某个显示器的 buffer 上。
     ///
-    /// `viewport` 是该 surface 在全局布局中的原点，宠物坐标为全局坐标，
-    /// 可能整体或部分位于本 surface 之外（双向裁剪）。
-    /// 穿透模式下整体降到 40% 不透明度作为视觉反馈。
-    pub fn blit(&self, buf: &mut [u32], buf_w: usize, viewport: (i32, i32), pet: &Pet) {
-        let scale = pet.scale as i32;
-        let pw = self.width as i32 * scale;
-        let ph = self.height as i32 * scale;
+    /// `viewport` 是该 surface 在全局布局中的原点，`dst` 是帧左上角全局坐标。
+    /// 穿透模式（dim）整体降到 40% 不透明度。
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_frame(
+        &self,
+        buf: &mut [u32],
+        buf_w: usize,
+        viewport: (i32, i32),
+        frame: FrameRect,
+        dst: (i32, i32),
+        scale: u32,
+        dim: bool,
+    ) {
+        let scale = scale as i32;
+        if scale <= 0 {
+            return;
+        }
+        let fw = frame.w as i32;
+        let fh = frame.h as i32;
         let buf_h = (buf.len() / buf_w) as i32;
 
-        // 宠物在 buffer 局部坐标中的位置
-        let px = pet.x - viewport.0;
-        let py = pet.y - viewport.1;
+        // 帧在 buffer 局部坐标中的位置
+        let px = dst.0 - viewport.0;
+        let py = dst.1 - viewport.1;
 
         // 与 buffer 的可见交集
         let vx0 = px.max(0);
         let vy0 = py.max(0);
-        let vx1 = (px + pw).min(buf_w as i32);
-        let vy1 = (py + ph).min(buf_h);
+        let vx1 = (px + fw * scale).min(buf_w as i32);
+        let vy1 = (py + fh * scale).min(buf_h);
         if vx0 >= vx1 || vy0 >= vy1 {
             return;
         }
 
-        // 映射回 sprite 像素坐标（起点向上对齐到 scale 边界，终点向下对齐）
+        // 映射回帧内像素坐标（起点向上对齐 scale 边界，终点向下对齐）
         let sx0 = (vx0 - px + scale - 1) / scale;
         let sy0 = (vy0 - py + scale - 1) / scale;
-        let sx1 = (vx1 - px) / scale;
-        let sy1 = (vy1 - py) / scale;
+        let sx1 = ((vx1 - px) / scale).min(fw);
+        let sy1 = ((vy1 - py) / scale).min(fh);
 
-        let dim = pet.passthrough;
         for sy in sy0..sy1 {
             for sx in sx0..sx1 {
-                let mut c = self.pixels[sy as usize * self.width as usize + sx as usize];
+                let mut c = self.pixels[(frame.y as i32 + sy) as usize * self.width as usize
+                    + (frame.x as i32 + sx) as usize];
                 let a = (c >> 24) & 0xff;
                 if a == 0 {
                     continue;
                 }
                 if dim {
-                    // 预乘像素整体缩放即可降不透明度
                     c = (((c >> 24) & 0xff) * 2 / 5) << 24
                         | ((((c >> 16) & 0xff) * 2 / 5) << 16)
                         | ((((c >> 8) & 0xff) * 2 / 5) << 8)
@@ -114,117 +145,59 @@ impl Sprite {
             }
         }
     }
-}
 
-/// 默认贴图路径：~/.config/hyprpet/pet.png
-pub fn default_sprite_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("hyprpet").join("pet.png")
-}
-
-/// 32x32 像素小猫（程序生成，作为开箱即用的测试贴图）。
-fn default_cat() -> Sprite {
-    const W: u32 = 32;
-    const H: u32 = 32;
-
-    struct Painter {
-        px: Vec<u32>,
-    }
-    impl Painter {
-        fn set(&mut self, x: i32, y: i32, color: u32) {
-            if (0..W as i32).contains(&x) && (0..H as i32).contains(&y) {
-                self.px[(y as u32 * W + x as u32) as usize] = color;
-            }
+    /// 保存为 PNG（un-premultiply）。
+    pub fn save_png(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok();
         }
-        fn rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    self.set(x, y, color);
-                }
-            }
+        let mut img = image::RgbaImage::new(self.width, self.height);
+        for (i, p) in self.pixels.iter().enumerate() {
+            // 必须先提升到 u32 再做乘法，u8*255 会溢出回绕
+            let a = (p >> 24) as u8;
+            let unpremul = |v: u32| -> u8 {
+                if a > 0 { ((v * 255) / a as u32) as u8 } else { 0 }
+            };
+            let r = unpremul((p >> 16) & 0xff);
+            let g = unpremul((p >> 8) & 0xff);
+            let b = unpremul(p & 0xff);
+            img.put_pixel(i as u32 % self.width, i as u32 / self.width, image::Rgba([r, g, b, a]));
         }
+        img.save(path).with_context(|| format!("无法写入 {}", path.display()))?;
+        Ok(())
     }
 
-    // 预乘 ARGB 颜色
-    const fn c(a: u8, r: u8, g: u8, b: u8) -> u32 {
+    /// 预乘 ARGB 颜色（const 构造用）
+    pub const fn premul(a: u8, r: u8, g: u8, b: u8) -> u32 {
         ((a as u32) << 24) | (((r as u32 * a as u32 / 255) as u32) << 16)
             | (((g as u32 * a as u32 / 255) as u32) << 8)
             | ((b as u32 * a as u32 / 255) as u32)
     }
-    let fur = c(255, 245, 164, 75);
-    let fur_dark = c(255, 222, 130, 48);
-    let belly = c(255, 255, 232, 190);
-    let pink = c(255, 255, 138, 158);
-    let dark = c(255, 58, 44, 52);
-    let white = c(255, 255, 255, 255);
-    let blush = c(255, 255, 150, 150);
-
-    let mut p = Painter { px: vec![0u32; (W * H) as usize] };
-
-    // 耳朵
-    for i in 0..6 {
-        let inset = i / 2;
-        p.rect(5 + i, 3 + inset, 12 - inset, 5 + i, fur);
-        p.rect(20 + inset, 3 + inset, 27 - i, 5 + i, fur);
-    }
-    p.rect(8, 4, 10, 7, pink);
-    p.rect(22, 4, 24, 7, pink);
-    // 头 + 身体
-    p.rect(4, 6, 28, 24, fur);
-    p.rect(4, 6, 28, 9, fur_dark); // 头顶花纹
-    p.rect(2, 14, 30, 24, fur); // 身体外扩
-    // 肚皮
-    p.rect(11, 17, 21, 25, belly);
-    // 脚
-    p.rect(6, 23, 11, 27, fur_dark);
-    p.rect(21, 23, 26, 27, fur_dark);
-    p.rect(7, 25, 10, 27, pink);
-    p.rect(22, 25, 25, 27, pink);
-    // 眼睛（含高光）
-    p.rect(9, 12, 12, 15, dark);
-    p.rect(20, 12, 23, 15, dark);
-    p.set(11, 12, white);
-    p.set(22, 12, white);
-    // 腮红
-    p.rect(6, 15, 8, 16, blush);
-    p.rect(24, 15, 26, 16, blush);
-    // 鼻子 + 嘴
-    p.set(15, 16, pink);
-    p.set(16, 16, pink);
-    p.set(14, 17, dark);
-    p.set(17, 17, dark);
-    // 尾巴（右侧条纹）
-    p.rect(28, 16, 30, 22, fur);
-    p.rect(28, 16, 30, 18, fur_dark);
-    p.rect(28, 20, 30, 22, fur_dark);
-
-    let px = p.px;
-    Sprite { width: W, height: H, pixels: px }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 4x4 图，2x2 帧 → 4 帧
     #[test]
-    fn default_cat_is_opaque_in_center() {
-        let cat = default_cat();
-        assert!(cat.pixels[(15 * 32 + 15) as usize] >> 24 == 0xff);
+    fn grid_frames_layout() {
+        let sheet = Sheet::grid(vec![0; 16], 4, 4, 2, 2);
+        assert_eq!(sheet.frames.len(), 4);
+        assert_eq!(sheet.frame(3), FrameRect { x: 2, y: 2, w: 2, h: 2 });
     }
 
     /// PNG 往返必须保持颜色（回归：u8*255 溢出导致全黑）
     #[test]
     fn png_roundtrip_preserves_color() {
-        let dir = std::env::temp_dir().join("hyprpet_test_roundtrip");
+        let dir = std::env::temp_dir().join("hyprpet_sheet_test");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pet.png");
-        std::fs::remove_file(&path).ok();
-        let sprite = Sprite::load_or_default(&path).unwrap();
-        assert_eq!(sprite.pixels[(16 * 32 + 16) as usize], 0xFFFF8A9E); // 鼻子粉色
-        std::fs::remove_file(&path).ok();
+        let path = dir.join("sheet.png");
+        let px = vec![Sheet::premul(255, 245, 164, 75); 8 * 8];
+        let sheet = Sheet::grid(px, 8, 8, 4, 4);
+        sheet.save_png(&path).unwrap();
+        let (loaded, w, h) = Sheet::load_pixels(&path).unwrap();
+        assert_eq!((w, h), (8, 8));
+        assert_eq!(loaded[0], 0xFFF5A44B);
     }
 }
-
