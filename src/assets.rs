@@ -381,6 +381,29 @@ loop = false
 frames = [[2, 0], [3, 0]]
 next = "idle"
 
+# 系统高负载擦汗 → idle
+[actions.tired]
+fps = 2
+loop = true
+duration = 4
+frames = [[6, 3]]
+next = "idle"
+
+# 庆祝（预留：任务成功时触发）→ idle
+[actions.celebrate]
+fps = 6
+loop = false
+frames = [[7, 3], [7, 3], [3, 0]]
+next = "idle"
+
+# 陪读/打字（检测到编码进程）→ idle
+[actions.study]
+fps = 4
+loop = true
+duration = 12
+frames = [[3, 3], [4, 3]]
+next = "idle"
+
 # 被点击（开心）→ idle
 [actions.petted]
 fps = 6

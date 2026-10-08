@@ -47,6 +47,10 @@ impl FontKit {
         })?
     }
 
+    pub fn px(&self) -> f32 {
+        self.px
+    }
+
     pub fn text_width(&self, s: &str) -> f32 {
         s.chars()
             .map(|c| self.font.rasterize(c, self.px).0.advance_width)
@@ -68,6 +72,11 @@ impl FontKit {
         let buf_h = (buf.len() / buf_w) as i32;
         for ch in s.chars() {
             let (metrics, coverage) = self.font.rasterize(ch, self.px);
+            // 空格等零宽字形：只前进画笔
+            if metrics.width == 0 {
+                pen_x += metrics.advance_width;
+                continue;
+            }
             let gx = pen_x.round() as i32 + metrics.xmin;
             // fontdue bitmap 首行是字形最上行；ymin 是基线到下缘距离
             let gy_top = y_top + self.px as i32 - metrics.ymin - metrics.height as i32;
@@ -275,7 +284,7 @@ pub fn draw_bubble(
     let bh = font.px as i32 + pad + 4;
 
     let (px, py, pw, ph) = pet;
-    let mut bx = (px + pw / 2 - bw / 2).clamp(monitor.0, monitor.2 - bw);
+    let bx = (px + pw / 2 - bw / 2).clamp(monitor.0, monitor.2 - bw);
     let above = py - bh - 10 >= monitor.1;
     let by = if above { py - bh - 10 } else { py + ph + 10 };
 

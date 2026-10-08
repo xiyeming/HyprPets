@@ -243,6 +243,19 @@ pub fn build_sheet() -> Sheet {
     paint_frame(&mut px, 3, 3, Pose { eyes: Eyes::Open, tail_up: true, legs: 0, ..Default::default() });
     paint_frame(&mut px, 4, 3, Pose { eyes: Eyes::Open, tail_up: true, legs: 2, body_dy: 1, ..Default::default() });
     paint_frame(&mut px, 5, 3, Pose { eyes: Eyes::Blink, squash: 3, legs: 1, ..Default::default() });
+    // (6,3) 疲惫擦汗：闭眼 + 汗滴；(7,3) 庆祝：^^ 眼 + 跳起
+    paint_frame(&mut px, 6, 3, Pose { eyes: Eyes::Closed, body_dy: 1, ..Default::default() });
+    {
+        // 在 (6,3) 上画汗滴
+        let start = (3 * H * 256 + 6 * W) as usize;
+        let mut c = Cell { px: &mut px[start..], stride: 256, flip: false };
+        const SWEAT: u32 = p(255, 120, 200, 255);
+        c.set(13, 2, SWEAT);
+        c.set(14, 2, SWEAT);
+        c.set(13, 3, SWEAT);
+        c.set(14, 3, SWEAT);
+    }
+    paint_frame(&mut px, 7, 3, Pose { eyes: Eyes::Happy, tail_up: true, body_dy: -2, ..Default::default() });
 
     Sheet::grid(px, 256, 128, W, H)
 }
@@ -255,6 +268,6 @@ mod tests {
     fn sheet_has_32_frames() {
         let sheet = build_sheet();
         assert_eq!(sheet.frames.len(), 32);
-        assert!(sheet.pixels.iter().any(|&c| c >> 24 == 0xff));
+        assert!(sheet.pixels_probe().iter().any(|&c| c >> 24 == 0xff));
     }
 }

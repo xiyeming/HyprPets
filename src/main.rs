@@ -9,9 +9,11 @@
 //!   notify 热重载，右键菜单换肤
 //! - 渲染走 wl_shm SlotPool + nearest 采样，主线程事件循环（Wayland 要求）
 
+mod agent;
 mod assets;
 mod audio;
 mod builtin_cat;
+mod chat;
 mod fsm;
 mod hypr;
 mod pet;
@@ -31,6 +33,7 @@ use notify::{RecursiveMode, Watcher};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
@@ -39,10 +42,11 @@ use smithay_client_toolkit::shell::wlr_layer::{
 };
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
 };
 use wayland_client::globals::registry_queue_init;
+use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_region::WlRegion;
@@ -50,7 +54,9 @@ use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{delegate_noop, Connection, QueueHandle};
 
+use crate::agent::{AgentEvent, AgentRequest};
 use crate::assets::Character;
+use crate::chat::{Chat, Who};
 use crate::audio::Audio;
 use crate::fsm::Fsm;
 use crate::hypr::{HyprSockets, WinCache};
@@ -65,6 +71,7 @@ const BTN_RIGHT: u32 = 0x111;
 /// 来自信号线程 / 文件监视器的事件
 enum ControlEvent {
     TogglePassthrough,
+    OpenChat,
     Reload,
     Notify(String),
     Quit,
@@ -107,6 +114,16 @@ struct App {
 
     audio: Audio,
     bubble: Option<Bubble>,
+    chat: Option<Chat>,
+    agent_tx: Option<std::sync::mpsc::Sender<AgentRequest>>,
+    timers: Vec<(Instant, String)>,
+    /// 双击检测：上次左键按下的时间与位置
+    last_press: Option<(Instant, (f64, f64))>,
+    /// 状态感知冷却
+    last_sense: Instant,
+    sense_acc: f32,
+    cursor_acc: f32,
+    keyboard: Option<WlKeyboard>,
 
     /// 每显示器一个全屏 surface
     surfaces: Vec<PetSurface>,
@@ -337,6 +354,67 @@ impl App {
     }
 
     /// 全屏避让：所在显示器有可见全屏窗口时淡出并暂停漫游
+    /// 系统状态感知：高负载 → tired；检测到编码进程 → study
+    fn system_sense(&mut self, now: Instant) {
+        if self.physics.active || self.drag_offset.is_some() || self.chat.is_some() {
+            return;
+        }
+        // 冷却
+        if now.duration_since(self.last_sense) < std::time::Duration::from_secs(90) {
+            return;
+        }
+        let load = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()))
+            .unwrap_or(0.0);
+        let cores = std::thread::available_parallelism().map(|n| n.get() as f64).unwrap_or(4.0);
+        let mem_avail_pct = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                let mut lines = s.lines();
+                let total = lines
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok()))?;
+                let avail = s
+                    .lines()
+                    .find(|l| l.starts_with("MemAvailable"))
+                    .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok()))?;
+                Some(avail / total * 100.0)
+            })
+            .unwrap_or(100.0);
+
+        if load > cores * 1.5 || mem_avail_pct < 8.0 {
+            if self.set_action("tired") {
+                self.last_sense = now;
+            }
+            return;
+        }
+
+        // 编码进程检测（claude / codex / cursor-agent / cargo / rustc）
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            let busy = entries.flatten().any(|e| {
+                let pid = e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit());
+                if !pid {
+                    return false;
+                }
+                std::fs::read_to_string(e.path().join("comm"))
+                    .map(|c| {
+                        let c = c.trim();
+                        ["claude", "codex", "cursor-agent", "cargo", "rustc", "gemini", "pi"]
+                            .iter()
+                            .any(|p| c.starts_with(p))
+                    })
+                    .unwrap_or(false)
+            });
+            if busy && self.pet.hovered {
+                // 仅当用户看着宠物时进入陪读
+                if self.set_action("study") {
+                    self.last_sense = now;
+                }
+            }
+        }
+    }
+
     fn evading(&self) -> bool {
         let cx = self.pet.x + self.pet.width_px() / 2;
         self.monitor_of(cx)
@@ -448,6 +526,7 @@ impl App {
         let sheet = self.character.as_ref().map(|c| &c.sheet);
         let menu = self.menu.as_ref();
         let bubble = self.bubble.as_ref();
+        let chat = self.chat.as_ref();
         let font = self.font.as_ref();
         let evade = self.evading();
         let pet = &self.pet;
@@ -491,6 +570,11 @@ impl App {
                             (pet.x, pet.y, pet.width_px(), pet.height_px()),
                             mr,
                         );
+                    }
+                    if let Some(c) = chat {
+                        if let Some(f) = font {
+                            c.draw(f, pixels, buf_w, vp);
+                        }
                     }
                     if let Some(m) = menu {
                         m.draw(pixels, buf_w, vp);
@@ -640,6 +724,45 @@ impl App {
             }
         }
 
+        // 定时器到期
+        let due: Vec<String> = self
+            .timers
+            .iter()
+            .filter(|(t, _)| *t <= now)
+            .map(|(_, l)| l.clone())
+            .collect();
+        if !due.is_empty() {
+            self.timers.retain(|(t, _)| *t > now);
+            for label in due {
+                self.bubble = Some(Bubble {
+                    text: format!("⏰ {label}"),
+                    until: now + std::time::Duration::from_secs(8),
+                });
+                self.audio.play(&audio::sounds_dir().join("pop.wav"));
+                self.set_action("alert");
+            }
+            self.needs_redraw = true;
+        }
+
+        // 光标闪烁
+        if self.chat.is_some() {
+            self.cursor_acc += dt;
+            if self.cursor_acc >= 0.5 {
+                self.cursor_acc = 0.0;
+                if let Some(c) = &mut self.chat {
+                    c.toggle_cursor();
+                }
+                self.needs_redraw = true;
+            }
+        }
+
+        // 系统状态感知（每 5s，冷却 90s）
+        self.sense_acc += dt;
+        if self.sense_acc >= 5.0 {
+            self.sense_acc = 0.0;
+            self.system_sense(now);
+        }
+
         // 窗口缓存防抖刷新
         if let Some(t) = self.win_refresh_at {
             if now >= t {
@@ -734,6 +857,37 @@ impl App {
                 }
                 PointerEventKind::Press { button, .. } => {
                     if button == BTN_LEFT {
+                        // 双击唤起聊天
+                        let now = Instant::now();
+                        let dbl = self
+                            .last_press
+                            .map(|(t, p)| {
+                                now.duration_since(t) < std::time::Duration::from_millis(350)
+                                    && (global.0 - p.0).abs() < 8.0
+                                    && (global.1 - p.1).abs() < 8.0
+                            })
+                            .unwrap_or(false);
+                        self.last_press = Some((now, global));
+                        if dbl {
+                            self.drag_offset = None;
+                            self.pet.dragged = false;
+                            self.open_chat();
+                            continue;
+                        }
+                        if self.chat.is_some() {
+                            // 聊天模态：点击输入框外关闭
+                            let inside = self.chat.as_ref().map(|c| {
+                                let (x, y, w, h) = c.rect;
+                                global.0 >= x as f64
+                                    && global.0 <= (x + w as i32) as f64
+                                    && global.1 >= y as f64
+                                    && global.1 <= (y + h as i32) as f64
+                            });
+                            if inside == Some(false) {
+                                self.close_chat();
+                            }
+                            continue;
+                        }
                         if self.menu.is_some() {
                             // 模态菜单：命中切换，未命中关闭
                             let hit = self.menu.as_ref().and_then(|m| m.hit(global));
@@ -762,6 +916,7 @@ impl App {
                             self.needs_redraw = true;
                         }
                     } else if button == BTN_RIGHT {
+                        self.close_chat();
                         if self.menu.is_some() {
                             self.close_menu();
                         } else {
@@ -904,6 +1059,12 @@ impl SeatHandler for App {
                 Err(e) => eprintln!("[hyprpet] 获取 pointer 失败: {e}"),
             }
         }
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(kbd) => self.keyboard = Some(kbd),
+                Err(e) => eprintln!("[hyprpet] 获取 keyboard 失败: {e}"),
+            }
+        }
     }
 
     fn remove_capability(
@@ -916,6 +1077,171 @@ impl SeatHandler for App {
         if capability == Capability::Pointer {
             self.pointer = None;
         }
+        if capability == Capability::Keyboard {
+            self.keyboard = None;
+        }
+    }
+}
+
+// keysym 标准值（xkb）
+const KS_RETURN: u32 = 0xFF0D;
+const KS_ESCAPE: u32 = 0xFF1B;
+const KS_BACKSPACE: u32 = 0xFF08;
+
+impl KeyboardHandler for App {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _surface: &WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
+    ) {
+    }
+
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _surface: &WlSurface,
+        _serial: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        self.on_key_press(&event);
+    }
+
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _serial: u32,
+        _event: KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _serial: u32,
+        _modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
+        _layout: u32,
+    ) {
+    }
+
+    fn update_repeat_info(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _info: smithay_client_toolkit::seat::keyboard::RepeatInfo,
+    ) {
+    }
+
+    fn update_keymap(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &WlKeyboard,
+        _keymap: smithay_client_toolkit::seat::keyboard::Keymap,
+    ) {
+    }
+}
+
+impl App {
+    fn on_key_press(&mut self, event: &KeyEvent) {
+        let Some(chat) = &mut self.chat else { return };
+        let keysym = event.keysym;
+        let code: u32 = keysym.into();
+        if code == KS_RETURN {
+            let text = std::mem::take(&mut chat.input);
+            if !text.trim().is_empty() {
+                chat.push(Who::User, &text);
+                chat.busy = true;
+                if let Some(tx) = &self.agent_tx {
+                    let _ = tx.send(AgentRequest::Chat(text));
+                }
+            }
+        } else if code == KS_ESCAPE {
+            self.close_chat();
+            return;
+        } else if code == KS_BACKSPACE {
+            chat.input.pop();
+        } else if let Some(u) = &event.utf8 {
+            // 忽略控制组合键产生的文本
+            if !u.chars().any(|c| c.is_control()) {
+                chat.input.push_str(u);
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    fn open_chat(&mut self) {
+        if self.chat.is_some() {
+            return;
+        }
+        self.close_menu();
+        self.ensure_font();
+        let Some(bbox) = self.layout_bbox() else { return };
+        self.chat = Some(Chat::new(
+            (self.pet.x, self.pet.y),
+            self.pet.width_px(),
+            self.pet.height_px(),
+            bbox,
+        ));
+        // 独占键盘焦点
+        for s in &self.surfaces {
+            s.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            s.wl_surface.commit();
+        }
+        self.region_dirty = true;
+        self.needs_redraw = true;
+    }
+
+    fn close_chat(&mut self) {
+        if self.chat.is_none() {
+            return;
+        }
+        self.chat = None;
+        for s in &self.surfaces {
+            s.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            s.wl_surface.commit();
+        }
+        self.region_dirty = true;
+        self.needs_redraw = true;
+    }
+
+    fn on_agent_reply(&mut self, text: String) {
+        if let Some(chat) = &mut self.chat {
+            chat.push(Who::Pet, &text);
+            chat.busy = false;
+        } else {
+            // 对话框已关闭：用气泡展示回复
+            self.bubble = Some(Bubble {
+                text: text.chars().take(60).collect(),
+                until: Instant::now() + std::time::Duration::from_secs(6),
+            });
+            self.audio.play(&audio::sounds_dir().join("pop.wav"));
+        }
+        self.needs_redraw = true;
+    }
+
+    fn on_agent_timer(&mut self, minutes: f32, label: String) {
+        self.timers.push((Instant::now() + std::time::Duration::from_secs((minutes * 60.0) as u64), label));
     }
 }
 
@@ -980,6 +1306,7 @@ delegate_compositor!(App);
 delegate_output!(App);
 delegate_seat!(App);
 delegate_pointer!(App);
+delegate_keyboard!(App);
 delegate_layer!(App);
 delegate_shm!(App);
 delegate_registry!(App);
@@ -1115,6 +1442,14 @@ fn main() -> Result<()> {
         win_refresh_at: None,
         audio: Audio::new(),
         bubble: None,
+        chat: None,
+        agent_tx: None,
+        timers: Vec::new(),
+        last_press: None,
+        last_sense: Instant::now() - std::time::Duration::from_secs(120),
+        sense_acc: 0.0,
+        cursor_acc: 0.0,
+        keyboard: None,
         surfaces: Vec::new(),
         renderer: None,
         character: None,
@@ -1259,12 +1594,13 @@ fn main() -> Result<()> {
     std::thread::spawn({
         let tx = tx.clone();
         move || {
-            use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
+            use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
             let mut signals =
-                signal_hook::iterator::Signals::new([SIGUSR1, SIGTERM, SIGINT]).expect("注册信号失败");
+                signal_hook::iterator::Signals::new([SIGUSR1, SIGUSR2, SIGTERM, SIGINT]).expect("注册信号失败");
             for sig in signals.forever() {
                 let ev = match sig {
                     SIGUSR1 => ControlEvent::TogglePassthrough,
+                    SIGUSR2 => ControlEvent::OpenChat,
                     _ => ControlEvent::Quit,
                 };
                 if tx.send(ev).is_err() {
@@ -1299,11 +1635,29 @@ fn main() -> Result<()> {
         .handle()
         .insert_source(rx, |ev, _, app| match ev {
             ChannelEvent::Msg(ControlEvent::TogglePassthrough) => app.toggle_passthrough(),
+            ChannelEvent::Msg(ControlEvent::OpenChat) => app.open_chat(),
             ChannelEvent::Msg(ControlEvent::Reload) => app.pending_reload = true,
             ChannelEvent::Msg(ControlEvent::Notify(summary)) => app.on_notification(summary),
             ChannelEvent::Msg(ControlEvent::Quit) | ChannelEvent::Closed => std::process::exit(0),
         })
         .map_err(|e| anyhow::anyhow!("注册信号事件源失败: {e:?}"))?;
+
+    // Agent worker 线程（LLM + 工具 + MCP）
+    let (agent_evt_tx, agent_evt_rx) = channel::channel::<AgentEvent>();
+    app.agent_tx = Some(agent::spawn_agent(agent_evt_tx));
+    event_loop
+        .handle()
+        .insert_source(agent_evt_rx, |ev, _, app| match ev {
+            ChannelEvent::Msg(AgentEvent::Reply(text)) => app.on_agent_reply(text),
+            ChannelEvent::Msg(AgentEvent::Busy(b)) => {
+                if let Some(c) = &mut app.chat {
+                    c.busy = b;
+                }
+            }
+            ChannelEvent::Msg(AgentEvent::Timer(minutes, label)) => app.on_agent_timer(minutes, label),
+            ChannelEvent::Closed => {}
+        })
+        .map_err(|e| anyhow::anyhow!("注册 agent 事件源失败: {e:?}"))?;
 
     // 加载角色
     let dir = current_dir.unwrap_or(builtin_dir);

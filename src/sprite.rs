@@ -74,6 +74,11 @@ impl Sheet {
         Ok((pixels, w, h))
     }
 
+    /// 调试访问（测试/诊断用）
+    pub fn pixels_probe(&self) -> &[u32] {
+        &self.pixels
+    }
+
     pub fn frame(&self, idx: usize) -> FrameRect {
         self.frames.get(idx).copied().unwrap_or(FrameRect { x: 0, y: 0, w: self.frame_w, h: self.frame_h })
     }
