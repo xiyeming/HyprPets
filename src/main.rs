@@ -325,16 +325,19 @@ impl App {
     }
 
     /// 宠物 x 范围内的候选地板：显示器底缘 + 该显示器可见工作区的窗口顶缘
+    /// 宠物 x 范围内的候选地板（**可站立的宠物 y** = 表面 y - 宠物高度）：
+    /// 显示器下沿与可见工作区窗口顶缘
     fn floors_at(&self, x0: i32, x1: i32) -> Vec<i32> {
         let mut v = Vec::new();
         let Some(mon) = self.monitor_of((x0 + x1) / 2) else { return v };
-        v.push(mon.origin.1 + mon.size.1 as i32);
+        let stand = mon.origin.1 + mon.size.1 as i32 - self.pet.height_px();
+        v.push(stand);
         for w in self.win_cache.visible_windows_on(&mon.name) {
             if w.fullscreen > 0 {
                 continue;
             }
             if w.x < x1 && w.x + w.w > x0 {
-                v.push(w.y);
+                v.push(w.y - self.pet.height_px());
             }
         }
         v.sort_unstable();
@@ -413,6 +416,16 @@ impl App {
                 }
             }
         }
+    }
+
+    /// 宠物 bbox 是否与可见窗口实体相交（窗口侧壁/穿模检测）
+    fn window_blocking(&self, x0: i32, y0: i32) -> bool {
+        let x1 = x0 + self.pet.width_px();
+        let y1 = y0 + self.pet.height_px();
+        let Some(mon) = self.monitor_of((x0 + x1) / 2) else { return false };
+        self.win_cache.visible_windows_on(&mon.name).any(|w| {
+            w.fullscreen == 0 && w.x < x1 && w.x + w.w > x0 && w.y < y1 && w.y + w.h > y0
+        })
     }
 
     fn evading(&self) -> bool {
@@ -552,7 +565,7 @@ impl App {
                     let alpha = if pet.passthrough {
                         102
                     } else if evade {
-                        64
+                        110
                     } else {
                         255
                     };
@@ -702,6 +715,11 @@ impl App {
                                 self.pet.x = old_x;
                                 hit_wall = true;
                             }
+                        }
+                        // 窗口实体碰撞（下落掠过窗口上方后站在窗顶不算，站在地板走入窗口区域算）
+                        if !hit_wall && self.window_blocking(self.pet.x, self.pet.y) {
+                            self.pet.x = old_x;
+                            hit_wall = true;
                         }
 
                         if (def.auto_turn && hit_wall) || (def.auto_turn && (self.pet.x <= bbox.0 || self.pet.x + self.pet.width_px() >= bbox.2)) {
@@ -932,10 +950,11 @@ impl App {
                         self.pet.dragged = false;
                         let speed = (vx.hypot(vy)) as f32;
                         // 快速甩动 → 抛掷；或宠物悬在空中 → 小掉落自然落地
-                        let off_ground = self
-                            .layout_bbox()
-                            .map(|b| (self.ground_y(b) - self.pet.y).abs() > 4)
-                            .unwrap_or(false);
+                        //（空中判定：距最近可站立地板 >4px）
+                        let off_ground = !matches!(
+                            self.floor_status(self.pet.x, self.pet.x + self.pet.width_px(), self.pet.y),
+                            FloorStatus::OnFloor(_)
+                        );
                         if speed > Physics::TOSS_THRESHOLD || off_ground {
                             self.physics.toss(vx as f32, vy as f32);
                             self.set_action("fall");
