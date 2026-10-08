@@ -1,0 +1,53 @@
+//! 宠物状态：位置、尺寸、缩放与交互标志。
+
+/// 宠物在屏幕（surface 局部坐标）中的状态。
+pub struct Pet {
+    /// 左上角 x（像素，已含缩放）
+    pub x: i32,
+    /// 左上角 y
+    pub y: i32,
+    /// 原始贴图宽度
+    pub w: u32,
+    /// 原始贴图高度
+    pub h: u32,
+    /// 像素放大倍率（nearest 采样）
+    pub scale: u32,
+    /// 穿透模式：input region 置空，宠物不接收任何指针事件
+    pub passthrough: bool,
+    /// 指针悬停中
+    pub hovered: bool,
+    /// 正被拖拽
+    pub dragged: bool,
+}
+
+impl Pet {
+    pub fn new(w: u32, h: u32, scale: u32) -> Self {
+        Pet {
+            x: 48,
+            y: 48,
+            w,
+            h,
+            scale: scale.max(1),
+            passthrough: false,
+            hovered: false,
+            dragged: false,
+        }
+    }
+
+    /// 屏幕上的实际占位尺寸
+    pub fn width_px(&self) -> i32 {
+        self.w as i32 * self.scale as i32
+    }
+
+    pub fn height_px(&self) -> i32 {
+        self.h as i32 * self.scale as i32
+    }
+
+    /// 把宠物位置钳制在屏幕内
+    pub fn clamp_to(&mut self, surface_w: u32, surface_h: u32) {
+        let max_x = (surface_w as i32 - self.width_px()).max(0);
+        let max_y = (surface_h as i32 - self.height_px()).max(0);
+        self.x = self.x.clamp(0, max_x);
+        self.y = self.y.clamp(0, max_y);
+    }
+}

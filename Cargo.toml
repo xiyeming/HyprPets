@@ -1,0 +1,21 @@
+[package]
+name = "hyprpet"
+version = "0.1.0"
+edition = "2024"
+description = "Pixel desktop pet for Hyprland (Wayland layer-shell)"
+license = "MIT"
+
+[dependencies]
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+calloop = "0.13"
+calloop-wayland-source = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+signal-hook = "0.3"
+anyhow = "1"
+
+[profile.release]
+opt-level = 2
+debug = false
+strip = true
+lto = "thin"
