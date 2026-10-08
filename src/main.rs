@@ -439,8 +439,12 @@ impl App {
                         }
                     }
                 }
-                // 非拖拽/非物理时保持贴地
-                self.pet.y = ground;
+                // 非拖拽/非物理时保持贴地（位置变化必须标记 moved，
+                // 否则 input region 停在旧位置导致无法再次抓取）
+                if self.pet.y != ground {
+                    self.pet.y = ground;
+                    moved = true;
+                }
             }
         }
 
@@ -569,7 +573,12 @@ impl App {
                         self.drag_samples.clear();
                         self.pet.dragged = false;
                         let speed = (vx.hypot(vy)) as f32;
-                        if speed > Physics::TOSS_THRESHOLD {
+                        // 快速甩动 → 抛掷；或宠物悬在空中 → 小掉落自然落地
+                        let off_ground = self
+                            .layout_bbox()
+                            .map(|b| (self.ground_y(b) - self.pet.y).abs() > 4)
+                            .unwrap_or(false);
+                        if speed > Physics::TOSS_THRESHOLD || off_ground {
                             self.physics.toss(vx as f32, vy as f32);
                             self.set_action("fall");
                         } else {
