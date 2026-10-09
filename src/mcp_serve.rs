@@ -63,6 +63,14 @@ struct SkinRequest {
     name: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct StatusRequest {
+    #[schemars(description = "状态：thinking/working/done/warning/error/confirm/idle")]
+    state: String,
+    #[schemars(description = "可选气泡消息")]
+    message: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PetMcp {
     tool_router: ToolRouter<Self>,
@@ -117,6 +125,12 @@ impl PetMcp {
     #[tool(description = "列出可用皮肤")]
     async fn skins(&self) -> ToolResult {
         ok(ctl("skins"))
+    }
+
+    #[tool(description = "同步 agent 工作状态：thinking/working/done/warning/error/confirm/idle，宠物显示状态点+动作+音效")]
+    async fn status(&self, Parameters(StatusRequest { state, message }): Parameters<StatusRequest>) -> ToolResult {
+        let msg = message.unwrap_or_default();
+        ok(ctl(&format!("state {state} {msg}")))
     }
 }
 

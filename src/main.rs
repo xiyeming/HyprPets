@@ -74,7 +74,7 @@ use crate::physics::Physics;
 use crate::renderer::Renderer;
 use crate::settings::Settings;
 use crate::tray::TrayMsg;
-use crate::ui::{Bubble, FontKit, Menu, MenuCmd, MenuItem as UiMenuItem};
+use crate::ui::{fill_rect, stroke_rect, Bubble, FontKit, Menu, MenuCmd, MenuItem as UiMenuItem};
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -129,6 +129,23 @@ enum EdgeDir {
     Right,
     Top,
     Bottom,
+}
+
+/// agent 语义状态（与 agent 工具联动）
+#[derive(Clone, Copy, PartialEq)]
+enum StatusKind {
+    Thinking,
+    Working,
+    Done,
+    Warning,
+    Error,
+    Confirm,
+}
+
+struct AgentStatus {
+    kind: StatusKind,
+    text: String,
+    since: Instant,
 }
 
 /// 客户端键盘自动重复状态（合成器/fcitx5 不发重复事件时本地驱动）
@@ -220,6 +237,8 @@ struct App {
     /// 保持 global 绑定存活
     #[allow(dead_code)]
     layer_shell: LayerShell,
+    /// agent 语义状态（头顶状态点 + 动作 + 音效）
+    agent_status: Option<AgentStatus>,
     /// 系统托盘句柄
     tray_handle: Option<ksni::blocking::Handle<tray::PetTray>>,
     /// 保持文件监视器存活
@@ -861,6 +880,45 @@ impl App {
         self.sync_tray();
     }
 
+    /// agent 状态联动：状态点 + 动作 + 音效 + 气泡
+    fn set_agent_status(&mut self, kind_str: &str, text: &str) {
+        let kind = match kind_str {
+            "thinking" | "think" => StatusKind::Thinking,
+            "working" | "work" => StatusKind::Working,
+            "done" | "success" | "complete" => StatusKind::Done,
+            "warning" | "warn" => StatusKind::Warning,
+            "error" | "fail" | "exception" => StatusKind::Error,
+            "confirm" | "ask" => StatusKind::Confirm,
+            "idle" | "clear" | "" => {
+                self.agent_status = None;
+                self.needs_redraw = true;
+                return;
+            }
+            other => {
+                eprintln!("[hyprpet] 未知状态: {other}");
+                return;
+            }
+        };
+        let (sound, action, default_text, color) = match kind {
+            StatusKind::Thinking => ("pop", "study", "🤔 思考中…", 0xFFF5C966u32),
+            StatusKind::Working => ("pop", "study", "⚙️ 工作中…", 0xFF6AA6FF),
+            StatusKind::Done => ("success", "celebrate", "✅ 完成！", 0xFF7FE08A),
+            StatusKind::Warning => ("warn", "alert", "⚠️ 警告", 0xFFFFB347),
+            StatusKind::Error => ("error", "tired", "❌ 出错了", 0xFFFF6B6B),
+            StatusKind::Confirm => ("confirm", "alert", "❓ 需要确认", 0xFFC9A0FF),
+        };
+        let _ = color;
+        let text = if text.is_empty() { default_text } else { text };
+        audio::play_named(&self.audio, sound);
+        self.set_action(action);
+        self.bubble = Some(Bubble {
+            text: text.chars().take(60).collect(),
+            until: Instant::now() + std::time::Duration::from_secs(4),
+        });
+        self.agent_status = Some(AgentStatus { kind, text: text.to_string(), since: Instant::now() });
+        self.needs_redraw = true;
+    }
+
     /// 托盘勾选状态同步
     fn sync_tray(&mut self) {
         if let Some(h) = &self.tray_handle {
@@ -1138,6 +1196,12 @@ impl App {
                 self.open_menu();
                 "ok".into()
             }
+            "state" => {
+                let kind = it.next().unwrap_or("");
+                let text: String = it.collect::<Vec<_>>().join(" ");
+                self.set_agent_status(kind, &text);
+                "ok".into()
+            }
             "settings" => {
                 self.open_settings();
                 "ok".into()
@@ -1173,6 +1237,7 @@ impl App {
         let sheet = self.character.as_ref().map(|c| &c.sheet);
         let menu = self.menu.as_ref();
         let bubble = self.bubble.as_ref();
+        let agent_status = self.agent_status.as_ref();
         let chat = self.chat.as_ref();
         let settings = self.settings.as_ref();
         let font = self.font.as_ref();
@@ -1210,6 +1275,22 @@ impl App {
                         sheet.blit_frame(
                             pixels, buf_w, vp, rect, (pet.x, pet.y), pet.scale, alpha, flip_y,
                         );
+                    }
+                    // agent 状态点（头顶右上）
+                    if let Some(st) = agent_status {
+                        let dot = 10i32;
+                        let dx = pet.x + pet.width_px() - dot;
+                        let dy = pet.y - dot - 4;
+                        let color = match st.kind {
+                            StatusKind::Thinking => 0xFFF5C966u32,
+                            StatusKind::Working => 0xFF6AA6FF,
+                            StatusKind::Done => 0xFF7FE08A,
+                            StatusKind::Warning => 0xFFFFB347,
+                            StatusKind::Error => 0xFFFF6B6B,
+                            StatusKind::Confirm => 0xFFC9A0FF,
+                        };
+                        fill_rect(pixels, buf_w, vp, (dx, dy, dot as u32, dot as u32), color);
+                        stroke_rect(pixels, buf_w, vp, (dx, dy, dot as u32, dot as u32), 0xFF20242Fu32);
                     }
                     if let (Some(b), Some(f), Some(mr)) = (bubble, font, mon_rect) {
                         ui::draw_bubble(
@@ -1259,6 +1340,14 @@ impl App {
         self.last_tick = now;
 
         self.tick_key_repeat();
+
+        // agent「完成」状态自动消退
+        if let Some(st) = &self.agent_status {
+            if st.kind == StatusKind::Done && st.since.elapsed() > std::time::Duration::from_secs(6) {
+                self.agent_status = None;
+                self.needs_redraw = true;
+            }
+        }
 
         let Some(bbox) = self.layout_bbox() else { return };
         let mut moved = false;
@@ -2608,6 +2697,7 @@ fn main() -> Result<()> {
         sense_acc: 0.0,
         cursor_acc: 0.0,
         tray_handle: None,
+        agent_status: None,
         behavior: BehaviorConfig::load(),
         seat: None,
         idle_notifier,

@@ -101,8 +101,26 @@ hyprpet mcp setup claude-code   # 或单个
 hyprpet mcp export all          # 把 hyprpet 的 [[mcp]] 列表推送到其他 agent 配置
 ```
 
-注册使用当前二进制绝对路径，JSON/TOML 合并且保留已有配置。重启对应 agent 后，
+注册使用当前二进制绝对路径，JSON/TOML 合并且保留已有配置（改前自动备份）。重启对应 agent 后，
 Claude Code 里就能调用 `say` 让宠物播报任务结果、Codex 里能 `act celebrate` 庆祝构建成功。
+
+### Agent 状态联动（思考/工作/完成/警告/异常/确认）
+
+`status` 工具（或 socket `state` 命令）同步 agent 状态，宠物以
+**头顶彩色状态点 + 动作 + 专属音效** 反馈：
+
+| 状态 | 效果 | 音效 |
+|---|---|---|
+| thinking | 黄点 + study 陪读 | pop |
+| working | 蓝点 + study | pop |
+| done | 绿点 + celebrate 蹦跳（6s 自动消退） | 成功上行琶音 |
+| warning | 橙点 + alert 警觉 | 警告双音 |
+| error | 红点 + 疲惫 | 错误低音 |
+| confirm | 紫点（保持，直到 idle） | 确认清脆 |
+
+示例：agent 任务开始 `status({state:"working", message:"编译中"})`，
+完成 `status({state:"done", message:"构建成功"})`。
+脚本/CI 用 `echo "state done 构建成功" | socat - UNIX-CONNECT:$SOCK`。
 
 内置工具：`get_system_status`、`set_timer`、`get_clipboard`、`run_command`（白名单），以及所有已配置 MCP server 的工具。
 
