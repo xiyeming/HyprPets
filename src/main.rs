@@ -244,6 +244,8 @@ struct App {
     edge_peek: Option<EdgePeek>,
     /// 左键按下起点（单击判定）
     press_start: Option<(f64, f64)>,
+    /// 本次悬停是否已触发过反应（避免重复）
+    hover_reacted: bool,
     /// 双击检测：上次左键按下的时间与位置
     last_press: Option<(Instant, (f64, f64))>,
     /// 状态感知冷却
@@ -1414,9 +1416,30 @@ impl App {
             match event.kind {
                 PointerEventKind::Enter { .. } => {
                     self.pet.hovered = true;
+                    // 悬停反应：宠物注意到你（alert 睁大眼；仅在空闲/睡觉时触发一次）
+                    if !self.hover_reacted
+                        && self.drag_offset.is_none()
+                        && self.menu.is_none()
+                        && self.chat.is_none()
+                        && !self.mini_hidden()
+                        && !self.physics.active
+                    {
+                        let cur = self.fsm.as_ref().map(|f| f.current.clone()).unwrap_or_default();
+                        if (cur == "idle" || cur == "sleep") && self.set_action("alert") {
+                            self.hover_reacted = true;
+                            self.needs_redraw = true;
+                        }
+                    }
                 }
                 PointerEventKind::Leave { .. } => {
                     self.pet.hovered = false;
+                    self.hover_reacted = false;
+                    // 悬停结束：若还停留在悬停触发的 alert 则回 idle
+                    if self.drag_offset.is_none()
+                        && self.fsm.as_ref().map(|f| f.current.as_str()) == Some("alert")
+                    {
+                        self.set_action("idle");
+                    }
                     // 拖拽/菜单中不取消：跨屏时旧 surface 必然 Leave，
                     // 目标 surface 是全屏 region，会继续推送事件
                 }
@@ -1563,12 +1586,21 @@ impl App {
                         self.drag_offset = None;
                         self.drag_samples.clear();
                         self.pet.dragged = false;
-                        // mini 下单击（位移 <6px）→ 收边
+                        // 单击判定（位移 <6px）
+                        let mut petted = false;
                         if let Some(p0) = self.press_start.take() {
                             let moved = (global.0 - p0.0).abs() > 6.0 || (global.1 - p0.1).abs() > 6.0;
                             if !moved && self.pet.is_mini() && !self.mini_hidden() {
                                 self.mini_hide();
                                 continue;
+                            }
+                            // 触摸：单击抚摸 → petted（角色缺失该动作则静默回落）
+                            if !moved && !self.pet.is_mini() && !self.physics.active {
+                                petted = self.set_action("petted");
+                                if petted {
+                                    self.audio.play(&audio::sounds_dir().join("pop.wav"));
+                                    self.needs_redraw = true;
+                                }
                             }
                         }
                         let speed = (vx.hypot(vy)) as f32;
@@ -1578,6 +1610,11 @@ impl App {
                             self.floor_status(self.pet.x, self.pet.x + self.pet.width_px(), self.pet.y),
                             FloorStatus::OnFloor(_)
                         );
+                        // 抚摸触发的释放不再走落地/抛掷逻辑（否则 land 会覆盖 petted）
+                        if petted {
+                            self.region_dirty = true;
+                            continue;
+                        }
                         if speed > Physics::TOSS_THRESHOLD || off_ground {
                             self.physics.toss(vx as f32, vy as f32);
                             self.set_action("fall");
@@ -2306,6 +2343,7 @@ fn main() -> Result<()> {
         mini_scale: 2,
         edge_peek: None,
         press_start: None,
+        hover_reacted: false,
         keyboard: None,
         surfaces: Vec::new(),
         renderer: None,

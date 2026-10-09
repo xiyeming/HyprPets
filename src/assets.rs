@@ -22,6 +22,8 @@ use crate::sprite::{FrameRect, Sheet};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct Meta {
+    /// 内置资源版本（用于升级已生成的内置角色）
+    pub version: Option<u32>,
     pub name: Option<String>,
     pub author: Option<String>,
     pub scale: Option<u32>,
@@ -295,10 +297,23 @@ pub fn scan_characters() -> Vec<(String, PathBuf)> {
     out
 }
 
+/// 内置角色内容版本：结构变化时 +1，已生成的旧版本会被重写
+const BUILTIN_VERSION: u32 = 2;
+
+fn builtin_needs_refresh(dir: &Path) -> bool {
+    if !dir.join("actions.toml").exists() {
+        return true;
+    }
+    let Ok(meta) = fs::read_to_string(dir.join("meta.toml")) else {
+        return true;
+    };
+    toml::from_str::<Meta>(&meta).ok().and_then(|m| m.version).unwrap_or(0) < BUILTIN_VERSION
+}
+
 /// 首次运行：写入内置史莱姆角色
 pub fn ensure_builtin_slime() -> Result<PathBuf> {
     let dir = characters_dir().join("builtin_slime");
-    if !dir.join("actions.toml").exists() {
+    if builtin_needs_refresh(&dir) {
         fs::create_dir_all(&dir)?;
         crate::builtin_slime::build_sheet().save_png(&dir.join("sprites.png"))?;
         fs::write(dir.join("meta.toml"), SLIME_META)?;
@@ -310,7 +325,7 @@ pub fn ensure_builtin_slime() -> Result<PathBuf> {
 /// 首次运行：写入内置小猫角色
 pub fn ensure_builtin_character() -> Result<PathBuf> {
     let dir = characters_dir().join("builtin_cat");
-    if !dir.join("actions.toml").exists() {
+    if builtin_needs_refresh(&dir) {
         fs::create_dir_all(&dir)?;
         crate::builtin_cat::build_sheet().save_png(&dir.join("sprites.png"))?;
         fs::write(dir.join("meta.toml"), BUILTIN_META)?;
@@ -320,6 +335,7 @@ pub fn ensure_builtin_character() -> Result<PathBuf> {
 }
 
 const BUILTIN_META: &str = r#"
+version = 2
 name = "像素小猫"
 author = "hyprpet"
 scale = 4
@@ -418,13 +434,14 @@ next = "idle"
 
 # 被点击（开心）→ idle
 [actions.petted]
-fps = 6
+fps = 3
 loop = false
-frames = [[3, 0], [3, 0]]
+frames = [[3, 0], [3, 0], [3, 0], [3, 0], [3, 0], [3, 0]]
 next = "idle"
 "#;
 
 const SLIME_META: &str = r#"
+version = 2
 name = "像素史莱姆"
 author = "hyprpet"
 scale = 4
@@ -511,8 +528,8 @@ frames = [[2, 3], [3, 3]]
 next = "idle"
 
 [actions.petted]
-fps = 6
+fps = 3
 loop = false
-frames = [[3, 0], [3, 0]]
+frames = [[3, 0], [3, 0], [3, 0], [3, 0], [3, 0], [3, 0]]
 next = "idle"
 "#;
