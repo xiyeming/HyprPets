@@ -154,7 +154,7 @@ pub struct Menu {
 }
 
 const ITEM_PAD: i32 = 6;
-const PREVIEW_SCALE: u32 = 2;
+const PREVIEW_SCALE: u32 = 1;
 const BORDER: i32 = 2;
 
 impl Menu {
