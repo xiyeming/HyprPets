@@ -924,10 +924,23 @@ impl App {
         const PEEK_RATIO: f32 = 0.55;
         let (w, h) = (self.pet.width_px(), self.pet.height_px());
         let cy = self.pet.y + h / 2;
-        let dl = cx - m.0;
-        let dr = m.2 - cx;
-        let dt = cy - m.1;
-        let db = m.3 - cy;
+        // 与邻屏共享的边不能藏：身体会跨到邻屏完整显示出来
+        let adjoin = |other: &PetSurface| -> bool {
+            other.configured
+                && (other.origin.0 - m.2).abs() <= 1
+                && (other.origin.1 - m.1).abs() <= 1
+        };
+        let blocked_left = self.surfaces.iter().any(|s| s.configured && (s.origin.0 + s.size.0 as i32 - m.0).abs() <= 1);
+        let blocked_right = self.surfaces.iter().any(|s| adjoin(s) && s.origin.0 >= m.2 - 1);
+        let blocked_top = self
+            .surfaces
+            .iter()
+            .any(|s| s.configured && (s.origin.1 + s.size.1 as i32 - m.1).abs() <= 1);
+        let blocked_bottom = self.surfaces.iter().any(|s| adjoin(s) && s.origin.1 >= m.3 - 1);
+        let dl = if blocked_left { i32::MAX } else { cx - m.0 };
+        let dr = if blocked_right { i32::MAX } else { m.2 - cx };
+        let dt = if blocked_top { i32::MAX } else { cy - m.1 };
+        let db = if blocked_bottom { i32::MAX } else { m.3 - cy };
         let min = dl.min(dr).min(dt).min(db);
         let pw = (w as f32 * PEEK_RATIO) as i32;
         let ph = (h as f32 * PEEK_RATIO) as i32;
@@ -1014,6 +1027,7 @@ impl App {
                 };
                 self.pet.x = x;
                 self.pet.y = y;
+                self.physics.stop();
                 if self.edge_peek.is_some() {
                     self.edge_peek = None;
                 }
