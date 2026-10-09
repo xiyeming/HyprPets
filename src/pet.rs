@@ -1,5 +1,12 @@
 //! 宠物状态：位置、尺寸、缩放与交互标志。
 
+/// 运行模式：正常 / mini（缩小、停漫游、可固定可收边）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PetMode {
+    Normal,
+    Mini,
+}
+
 /// 宠物在屏幕（surface 局部坐标）中的状态。
 pub struct Pet {
     /// 左上角 x（像素，已含缩放）
@@ -18,6 +25,8 @@ pub struct Pet {
     pub hovered: bool,
     /// 正被拖拽
     pub dragged: bool,
+    /// 运行模式
+    pub mode: PetMode,
 }
 
 impl Pet {
@@ -31,7 +40,12 @@ impl Pet {
             passthrough: false,
             hovered: false,
             dragged: false,
+            mode: PetMode::Normal,
         }
+    }
+
+    pub fn is_mini(&self) -> bool {
+        self.mode == PetMode::Mini
     }
 
     /// 屏幕上的实际占位尺寸

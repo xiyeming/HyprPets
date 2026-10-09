@@ -13,6 +13,7 @@ mod agent;
 mod assets;
 mod audio;
 mod builtin_cat;
+mod builtin_slime;
 mod chat;
 mod fsm;
 mod hypr;
@@ -62,7 +63,7 @@ use crate::chat::{Chat, Who};
 use crate::audio::Audio;
 use crate::fsm::Fsm;
 use crate::hypr::{HyprSockets, WinCache};
-use crate::pet::Pet;
+use crate::pet::{Pet, PetMode};
 use crate::physics::Physics;
 use crate::renderer::Renderer;
 use crate::ui::{Bubble, FontKit, Menu, MenuEntry};
@@ -74,6 +75,7 @@ const BTN_RIGHT: u32 = 0x111;
 enum ControlEvent {
     TogglePassthrough,
     OpenChat,
+    ToggleMini,
     Reload,
     Notify(String),
     Quit,
@@ -127,6 +129,13 @@ struct App {
     ti_surface: Option<WlSurface>,
     /// 本轮 done 周期内是否收到过 preedit_string
     ti_preedit_pending: bool,
+    /// mini 模式：进入前的缩放（恢复用）
+    normal_scale: u32,
+    mini_scale: u32,
+    /// 收边隐藏：收起前的位置（弹出恢复用）
+    mini_anchor: Option<(i32, i32)>,
+    /// 左键按下起点（单击判定）
+    press_start: Option<(f64, f64)>,
     /// 双击检测：上次左键按下的时间与位置
     last_press: Option<(Instant, (f64, f64))>,
     /// 状态感知冷却
@@ -284,7 +293,12 @@ impl App {
     fn save_current_character(&self) {
         let Some(c) = &self.character else { return };
         let name = c.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let state = format!("current = \"{name}\"\n");
+        let state = format!(
+            "current = \"{name}\"\nmode = \"{mode}\"\nx = {x}\ny = {y}\n",
+            mode = if self.pet.is_mini() { "mini" } else { "normal" },
+            x = self.pet.x,
+            y = self.pet.y
+        );
         let path = assets::characters_dir().join("state.toml");
         std::fs::write(path, state).ok();
     }
@@ -367,6 +381,55 @@ impl App {
     }
 
     /// 全屏避让：所在显示器有可见全屏窗口时淡出并暂停漫游
+    /// 气泡过期 / 定时器 / 光标闪烁 / 系统感知（mini 与普通共用）
+    fn tick_timers_bubble_cursor(&mut self, dt: f32, now: Instant) {
+        if let Some(b) = &self.bubble {
+            if b.until <= now {
+                self.bubble = None;
+                self.needs_redraw = true;
+            }
+        }
+
+        let due: Vec<String> = self
+            .timers
+            .iter()
+            .filter(|(t, _)| *t <= now)
+            .map(|(_, l)| l.clone())
+            .collect();
+        if !due.is_empty() {
+            self.timers.retain(|(t, _)| *t > now);
+            for label in due {
+                self.bubble = Some(Bubble {
+                    text: format!("⏰ {label}"),
+                    until: now + std::time::Duration::from_secs(8),
+                });
+                self.audio.play(&audio::sounds_dir().join("pop.wav"));
+                self.set_action("alert");
+            }
+            self.needs_redraw = true;
+        }
+
+        if self.chat.is_some() {
+            self.cursor_acc += dt;
+            if self.cursor_acc >= 0.5 {
+                self.cursor_acc = 0.0;
+                if let Some(c) = &mut self.chat {
+                    c.toggle_cursor();
+                }
+                self.needs_redraw = true;
+            }
+        }
+
+        if self.pet.is_mini() {
+            return;
+        }
+        self.sense_acc += dt;
+        if self.sense_acc >= 5.0 {
+            self.sense_acc = 0.0;
+            self.system_sense(now);
+        }
+    }
+
     /// 系统状态感知：高负载 → tired；检测到编码进程 → study
     fn system_sense(&mut self, now: Instant) {
         if self.physics.active || self.drag_offset.is_some() || self.chat.is_some() {
@@ -527,6 +590,161 @@ impl App {
         }
     }
 
+    // ---------- mini 模式 ----------
+
+    /// 切换 mini / 正常模式
+    fn toggle_mini(&mut self) {
+        if self.pet.is_mini() {
+            self.pet.mode = PetMode::Normal;
+            self.pet.scale = self.normal_scale.max(1);
+            self.mini_anchor = None;
+        } else {
+            self.close_chat();
+            self.pet.mode = PetMode::Mini;
+            self.normal_scale = self.pet.scale;
+            self.pet.scale = self.mini_scale.max(1);
+            self.physics.stop();
+            self.set_action("idle");
+        }
+        if let Some(b) = self.layout_bbox() {
+            self.pet.clamp_to(b.0, b.1, b.2, b.3);
+        }
+        self.region_dirty = true;
+        self.needs_redraw = true;
+        self.save_current_character();
+        eprintln!("[hyprpet] 模式: {}", if self.pet.is_mini() { "mini" } else { "正常" });
+    }
+
+    /// 收进最近的屏幕边缘（只留 6px 把手）
+    fn mini_hide(&mut self) {
+        if !self.pet.is_mini() {
+            return;
+        }
+        let cx = self.pet.x + self.pet.width_px() / 2;
+        let Some(m) = self.monitor_rect_of(cx) else { return };
+        if self.mini_anchor.is_none() {
+            self.mini_anchor = Some((self.pet.x, self.pet.y));
+        }
+        const TAB: i32 = 6;
+        let (w, h) = (self.pet.width_px(), self.pet.height_px());
+        let (dl, dr, dt, db) = (cx - m.0, m.2 - cx, 0, 0);
+        let cy = self.pet.y + h / 2;
+        let (dt2, db2) = (cy - m.1, m.3 - cy);
+        let min = dl.min(dr).min(dt2).min(db2);
+        if min == dl {
+            self.pet.x = m.0 - w + TAB;
+        } else if min == dr {
+            self.pet.x = m.2 - TAB;
+        } else if min == dt2 {
+            self.pet.y = m.1 - h + TAB;
+        } else {
+            self.pet.y = m.3 - TAB;
+        }
+        self.region_dirty = true;
+        self.needs_redraw = true;
+        self.save_current_character();
+    }
+
+    /// 从边缘弹出（恢复原位，无记录则屏内居中下）
+    fn mini_show(&mut self) {
+        if !self.pet.is_mini() {
+            return;
+        }
+        if let (Some((x, y)), Some(b)) = (self.mini_anchor, self.layout_bbox()) {
+            self.pet.x = x;
+            self.pet.y = y;
+            self.pet.clamp_to(b.0, b.1, b.2, b.3);
+        } else if let Some(b) = self.layout_bbox() {
+            self.pet.x = (b.0 + b.2) / 2 - self.pet.width_px() / 2;
+            self.pet.y = b.3 - self.pet.height_px() - 60;
+        }
+        self.mini_anchor = None;
+        self.region_dirty = true;
+        self.needs_redraw = true;
+        self.save_current_character();
+    }
+
+    fn mini_hidden(&self) -> bool {
+        self.pet.is_mini() && self.mini_anchor.is_some()
+    }
+
+    // ---------- 外部控制（agent 联动） ----------
+
+    /// 处理控制 socket 命令，返回响应行
+    fn handle_ctl(&mut self, line: &str) -> String {
+        let mut it = line.split_whitespace();
+        let cmd = it.next().unwrap_or("");
+        match cmd {
+            "say" => {
+                let text: String = it.collect::<Vec<_>>().join(" ");
+                if text.is_empty() {
+                    return "err: say <text>".into();
+                }
+                self.bubble = Some(Bubble {
+                    text: text.chars().take(60).collect(),
+                    until: Instant::now() + std::time::Duration::from_secs(6),
+                });
+                self.audio.play(&audio::sounds_dir().join("pop.wav"));
+                self.set_action("alert");
+                self.needs_redraw = true;
+                "ok".into()
+            }
+            "act" => {
+                let name = it.next().unwrap_or("");
+                if name.is_empty() {
+                    return "err: act <action>".into();
+                }
+                if self.set_action(name) {
+                    self.needs_redraw = true;
+                    "ok".into()
+                } else {
+                    format!("err: 无动作 {name}")
+                }
+            }
+            "pos" => {
+                let (Ok(x), Ok(y)) = (it.next().unwrap_or("").parse::<i32>(), it.next().unwrap_or("").parse::<i32>()) else {
+                    return "err: pos <x> <y>".into();
+                };
+                self.pet.x = x;
+                self.pet.y = y;
+                if let Some(b) = self.layout_bbox() {
+                    self.pet.clamp_to(b.0, b.1, b.2, b.3);
+                }
+                self.region_dirty = true;
+                self.needs_redraw = true;
+                "ok".into()
+            }
+            "skin" => {
+                let name = it.next().unwrap_or("");
+                let dir = assets::characters_dir().join(name);
+                if dir.is_dir() {
+                    self.switch_character(&dir);
+                    "ok".into()
+                } else {
+                    format!("err: 无角色 {name}")
+                }
+            }
+            "mini" => {
+                self.toggle_mini();
+                "ok".into()
+            }
+            "hide" => {
+                self.mini_hide();
+                "ok".into()
+            }
+            "show" => {
+                self.mini_show();
+                "ok".into()
+            }
+            "skins" => assets::scan_characters()
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            _ => "err: 未知命令（say/act/pos/skin/skins/mini/hide/show）".into(),
+        }
+    }
+
     fn on_notification(&mut self, summary: String) {
         self.ensure_font();
         self.bubble = Some(Bubble { text: summary, until: Instant::now() + std::time::Duration::from_secs(5) });
@@ -630,6 +848,20 @@ impl App {
         let Some(bbox) = self.layout_bbox() else { return };
         let mut moved = false;
         let mut animated = false;
+
+        // mini 模式：固定不动（仍走气泡/定时器/光标/跟随分支）
+        if self.pet.is_mini() {
+            if let Some(fsm) = &mut self.fsm {
+                if fsm.tick(dt) {
+                    animated = true;
+                }
+            }
+            if animated {
+                self.needs_redraw = true;
+            }
+            self.tick_timers_bubble_cursor(dt, now);
+            return;
+        }
 
         if self.physics.active {
             // 抛掷/下落：重力积分 + 地板穿越检测（可落在窗口顶缘）
@@ -749,52 +981,7 @@ impl App {
             }
         }
 
-        // 气泡过期
-        if let Some(b) = &self.bubble {
-            if b.until <= now {
-                self.bubble = None;
-                self.needs_redraw = true;
-            }
-        }
-
-        // 定时器到期
-        let due: Vec<String> = self
-            .timers
-            .iter()
-            .filter(|(t, _)| *t <= now)
-            .map(|(_, l)| l.clone())
-            .collect();
-        if !due.is_empty() {
-            self.timers.retain(|(t, _)| *t > now);
-            for label in due {
-                self.bubble = Some(Bubble {
-                    text: format!("⏰ {label}"),
-                    until: now + std::time::Duration::from_secs(8),
-                });
-                self.audio.play(&audio::sounds_dir().join("pop.wav"));
-                self.set_action("alert");
-            }
-            self.needs_redraw = true;
-        }
-
-        // 光标闪烁
-        if self.chat.is_some() {
-            self.cursor_acc += dt;
-            if self.cursor_acc >= 0.5 {
-                self.cursor_acc = 0.0;
-                if let Some(c) = &mut self.chat {
-                    c.toggle_cursor();
-                }
-                self.needs_redraw = true;
-            }
-        }
-
-        // 系统状态感知（每 5s，冷却 90s）
-        self.sense_acc += dt;
-        if self.sense_acc >= 5.0 {
-            self.sense_acc = 0.0;
-            self.system_sense(now);
-        }
+        self.tick_timers_bubble_cursor(dt, now);
 
         // 窗口缓存防抖刷新
         if let Some(t) = self.win_refresh_at {
@@ -912,7 +1099,16 @@ impl App {
                         if dbl {
                             self.drag_offset = None;
                             self.pet.dragged = false;
-                            self.open_chat();
+                            if self.pet.is_mini() {
+                                // mini 双击：已隐藏则弹出，可见则收起
+                                if self.mini_hidden() {
+                                    self.mini_show();
+                                } else {
+                                    self.mini_hide();
+                                }
+                            } else {
+                                self.open_chat();
+                            }
                             continue;
                         }
                         if self.chat.is_some() {
@@ -946,7 +1142,13 @@ impl App {
                             }
                             continue;
                         }
+                        if self.mini_hidden() {
+                            // 点把手弹出
+                            self.mini_show();
+                            continue;
+                        }
                         if !self.pet.passthrough {
+                            self.press_start = Some(global);
                             self.drag_offset =
                                 Some((global.0 - self.pet.x as f64, global.1 - self.pet.y as f64));
                             self.drag_samples.clear();
@@ -971,6 +1173,14 @@ impl App {
                         self.drag_offset = None;
                         self.drag_samples.clear();
                         self.pet.dragged = false;
+                        // mini 下单击（位移 <6px）→ 收边
+                        if let Some(p0) = self.press_start.take() {
+                            let moved = (global.0 - p0.0).abs() > 6.0 || (global.1 - p0.1).abs() > 6.0;
+                            if !moved && self.pet.is_mini() && !self.mini_hidden() {
+                                self.mini_hide();
+                                continue;
+                            }
+                        }
                         let speed = (vx.hypot(vy)) as f32;
                         // 快速甩动 → 抛掷；或宠物悬在空中 → 小掉落自然落地
                         //（空中判定：距最近可站立地板 >4px）
@@ -986,6 +1196,9 @@ impl App {
                         }
                         self.region_dirty = true;
                         self.needs_redraw = true;
+                        if self.pet.is_mini() {
+                            self.save_current_character();
+                        }
                     }
                 }
                 PointerEventKind::Axis { .. } => {}
@@ -1567,16 +1780,24 @@ fn main() -> Result<()> {
 
     // 首次运行写入内置角色与提示音
     let builtin_dir = assets::ensure_builtin_character().context("初始化内置角色失败")?;
+    assets::ensure_builtin_slime().context("初始化内置史莱姆失败")?;
     audio::ensure_builtin_sounds();
 
-    // 读取上次使用的角色
+    // 读取上次状态（角色 / 模式 / 位置）
     let state_path = assets::characters_dir().join("state.toml");
-    let current_dir = std::fs::read_to_string(&state_path)
+    let saved_state: std::collections::HashMap<String, String> = std::fs::read_to_string(&state_path)
         .ok()
-        .and_then(|s| toml::from_str::<std::collections::HashMap<String, String>>(&s).ok())
-        .and_then(|m| m.get("current").cloned())
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default();
+    let current_dir = saved_state
+        .get("current")
         .map(|name| assets::characters_dir().join(name))
         .filter(|p| p.exists());
+    let saved_mode = saved_state.get("mode").map(|s| s.as_str()).unwrap_or("normal");
+    let saved_pos = saved_state
+        .get("x")
+        .and_then(|x| x.parse::<i32>().ok())
+        .zip(saved_state.get("y").and_then(|y| y.parse::<i32>().ok()));
 
     let mut pet = Pet::new(32, 32, args.scale.unwrap_or(4));
     let mut placed = false;
@@ -1626,6 +1847,10 @@ fn main() -> Result<()> {
         last_sense: Instant::now() - std::time::Duration::from_secs(120),
         sense_acc: 0.0,
         cursor_acc: 0.0,
+        normal_scale: args.scale.unwrap_or(4),
+        mini_scale: 2,
+        mini_anchor: None,
+        press_start: None,
         keyboard: None,
         surfaces: Vec::new(),
         renderer: None,
@@ -1773,11 +1998,13 @@ fn main() -> Result<()> {
         move || {
             use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
             let mut signals =
-                signal_hook::iterator::Signals::new([SIGUSR1, SIGUSR2, SIGTERM, SIGINT]).expect("注册信号失败");
+                signal_hook::iterator::Signals::new([SIGUSR1, SIGUSR2, 10, SIGTERM, SIGINT]).expect("注册信号失败");
             for sig in signals.forever() {
+                // SIGUSR3 无 signal-hook 常量，值为 10
                 let ev = match sig {
                     SIGUSR1 => ControlEvent::TogglePassthrough,
                     SIGUSR2 => ControlEvent::OpenChat,
+                    10 => ControlEvent::ToggleMini,
                     _ => ControlEvent::Quit,
                 };
                 if tx.send(ev).is_err() {
@@ -1812,12 +2039,84 @@ fn main() -> Result<()> {
         .handle()
         .insert_source(rx, |ev, _, app| match ev {
             ChannelEvent::Msg(ControlEvent::TogglePassthrough) => app.toggle_passthrough(),
-            ChannelEvent::Msg(ControlEvent::OpenChat) => app.open_chat(),
+            ChannelEvent::Msg(ControlEvent::OpenChat) => {
+                if !app.pet.is_mini() {
+                    app.open_chat();
+                }
+            }
+            ChannelEvent::Msg(ControlEvent::ToggleMini) => app.toggle_mini(),
             ChannelEvent::Msg(ControlEvent::Reload) => app.pending_reload = true,
             ChannelEvent::Msg(ControlEvent::Notify(summary)) => app.on_notification(summary),
             ChannelEvent::Msg(ControlEvent::Quit) | ChannelEvent::Closed => std::process::exit(0),
         })
         .map_err(|e| anyhow::anyhow!("注册信号事件源失败: {e:?}"))?;
+
+    // 控制 socket（agent 联动：say/act/pos/skin/mini/hide/show）
+    let ctl_path = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("hyprpet.sock");
+    std::fs::remove_file(&ctl_path).ok();
+    match std::os::unix::net::UnixListener::bind(&ctl_path) {
+        Ok(listener) => {
+            use calloop::generic::Generic;
+            use calloop::{Interest, Mode};
+            use std::io::{Read as _, Write as _};
+            listener.set_nonblocking(true).ok();
+            let generic = Generic::new(listener, Interest::READ, Mode::Level);
+            if let Err(e) = event_loop.handle().insert_source(generic, move |_, listener, app| {
+                use calloop::PostAction;
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
+                            let mut buf = Vec::new();
+                            let mut chunk = [0u8; 512];
+                            let mut line = String::new();
+                            loop {
+                                match stream.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        buf.extend_from_slice(&chunk[..n]);
+                                        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                            line = String::from_utf8_lossy(&buf[..pos]).trim().to_string();
+                                            break;
+                                        }
+                                    }
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                                    {
+                                        if buf.is_empty() {
+                                            break;
+                                        }
+                                        line = String::from_utf8_lossy(&buf).trim().to_string();
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            let resp = if line.is_empty() {
+                                "err: 空命令".to_string()
+                            } else {
+                                app.handle_ctl(&line)
+                            };
+                            let _ = stream.write_all(format!("{resp}\n").as_bytes());
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            return Ok(PostAction::Continue)
+                        }
+                        Err(_) => return Ok(PostAction::Remove),
+                    }
+                }
+            }) {
+                eprintln!("[hyprpet] 控制 socket 注册失败: {e:?}");
+            } else {
+                eprintln!("[hyprpet] 控制 socket: {}", ctl_path.display());
+            }
+        }
+        Err(e) => eprintln!("[hyprpet] 控制 socket 绑定失败: {e}"),
+    }
 
     // Agent worker 线程（LLM + 工具 + MCP）
     let (agent_evt_tx, agent_evt_rx) = channel::channel::<AgentEvent>();
@@ -1832,13 +2131,28 @@ fn main() -> Result<()> {
                 }
             }
             ChannelEvent::Msg(AgentEvent::Timer(minutes, label)) => app.on_agent_timer(minutes, label),
+            ChannelEvent::Msg(AgentEvent::ToggleMini) => app.toggle_mini(),
+            ChannelEvent::Msg(AgentEvent::Hide) => app.mini_hide(),
+            ChannelEvent::Msg(AgentEvent::Show) => app.mini_show(),
             ChannelEvent::Closed => {}
         })
         .map_err(|e| anyhow::anyhow!("注册 agent 事件源失败: {e:?}"))?;
 
-    // 加载角色
+    // 加载角色并恢复模式/位置
     let dir = current_dir.unwrap_or(builtin_dir);
     app.apply_character(&dir);
+    if saved_mode == "mini" {
+        app.toggle_mini();
+    }
+    if let Some((x, y)) = saved_pos {
+        app.pet.x = x;
+        app.pet.y = y;
+        if let Some(b) = app.layout_bbox() {
+            app.pet.clamp_to(b.0, b.1, b.2, b.3);
+        }
+        app.region_dirty = true;
+        app.needs_redraw = true;
+    }
 
     // 进入主循环前先消费一轮初始状态
     on_idle(&mut app);

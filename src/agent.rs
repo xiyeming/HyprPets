@@ -127,6 +127,10 @@ pub enum AgentEvent {
     Timer(f32, String),
     /// 工作状态（气泡里显示 … ）
     Busy(bool),
+    /// mini 模式切换 / 收边 / 弹出
+    ToggleMini,
+    Hide,
+    Show,
 }
 
 // ---------- MCP 工具镜像 ----------
@@ -198,8 +202,20 @@ fn local_command(text: &str, config: &AgentConfig, tx_main: &calloop::channel::S
             Some(format!("好的喵，{} 分钟后提醒你：{}", minutes, label))
         }
         "/status" => Some(system_status()),
+        "/mini" => {
+            let _ = tx_main.send(AgentEvent::ToggleMini);
+            Some("已切换 mini 模式喵".into())
+        }
+        "/hide" => {
+            let _ = tx_main.send(AgentEvent::Hide);
+            Some("已收进屏幕边缘，点把手或 /show 弹出".into())
+        }
+        "/show" => {
+            let _ = tx_main.send(AgentEvent::Show);
+            Some("弹出来啦".into())
+        }
         "/help" => Some(
-            "可用命令：\n/timer <分钟> [事项] — 定时提醒\n/status — 系统状态\n/shell <命令> — 白名单命令执行\n\n配置 LLM（~/.config/hyprpet/agent.toml）后可直接聊天"
+            "可用命令：\n/timer <分钟> [事项] — 定时提醒\n/status — 系统状态\n/shell <命令> — 白名单命令执行\n/mini — 切换 mini 模式\n/hide — 收进屏幕边缘\n/show — 弹出\n\n配置 LLM（~/.config/hyprpet/agent.toml）后可直接聊天"
                 .into(),
         ),
         _ => {

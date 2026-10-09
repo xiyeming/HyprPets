@@ -17,8 +17,29 @@ Hyprland 像素桌面宠物（Rust + Wayland layer-shell）。
 |---|---|
 | 左键拖拽 / 快速甩动 | 移动 / 重力抛掷 |
 | 左键**双击**（或 `kill -USR2`） | 打开 AI 聊天对话框（支持 fcitx5 中文输入） |
-| 右键 | 换肤菜单 |
+| 右键 | 换肤菜单（像素小猫 / 像素史莱姆…） |
 | `kill -USR1` | 切换鼠标穿透 |
+| `kill -USR3` | 切换 mini 模式（缩小 · 停漫游 · 可固定任意位置） |
+| mini 下单击 / 双击 | 收进屏幕边缘（留 6px 把手）/ 弹出 |
+
+mini 模式：宠物缩小为 2x，自主行为全部暂停，拖到哪固定在哪；收边后只剩边缘小把手，点击把手或双击弹出。模式与位置自动记忆。
+
+## Agent 联动（控制 socket）
+
+任何脚本 / agent（pi、Claude Code、CI…）都可以通过 Unix socket 指挥宠物：
+
+```bash
+SOCK=$XDG_RUNTIME_DIR/hyprpet.sock
+echo "say 构建完成！" | socat - UNIX-CONNECT:$SOCK     # 说话气泡
+echo "act celebrate" | socat - UNIX-CONNECT:$SOCK      # 做动作
+echo "skin builtin_slime" | socat - UNIX-CONNECT:$SOCK # 换皮肤
+echo "pos 100 200" | socat - UNIX-CONNECT:$SOCK        # 移动
+echo "mini" | socat - UNIX-CONNECT:$SOCK               # mini 开关
+echo "hide" | socat - UNIX-CONNECT:$SOCK               # 收边
+echo "skins" | socat - UNIX-CONNECT:$SOCK              # 列出角色
+```
+
+聊天里也可 `/mini` `/hide` `/show`。
 
 聊天内命令（无需 LLM）：`/timer <分钟> [事项]`、`/status`、`/shell <命令>`、`/help`
 

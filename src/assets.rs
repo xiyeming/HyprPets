@@ -295,6 +295,18 @@ pub fn scan_characters() -> Vec<(String, PathBuf)> {
     out
 }
 
+/// 首次运行：写入内置史莱姆角色
+pub fn ensure_builtin_slime() -> Result<PathBuf> {
+    let dir = characters_dir().join("builtin_slime");
+    if !dir.join("actions.toml").exists() {
+        fs::create_dir_all(&dir)?;
+        crate::builtin_slime::build_sheet().save_png(&dir.join("sprites.png"))?;
+        fs::write(dir.join("meta.toml"), SLIME_META)?;
+        fs::write(dir.join("actions.toml"), SLIME_ACTIONS)?;
+    }
+    Ok(dir)
+}
+
 /// 首次运行：写入内置小猫角色
 pub fn ensure_builtin_character() -> Result<PathBuf> {
     let dir = characters_dir().join("builtin_cat");
@@ -405,6 +417,99 @@ frames = [[3, 3], [4, 3]]
 next = "idle"
 
 # 被点击（开心）→ idle
+[actions.petted]
+fps = 6
+loop = false
+frames = [[3, 0], [3, 0]]
+next = "idle"
+"#;
+
+const SLIME_META: &str = r#"
+name = "像素史莱姆"
+author = "hyprpet"
+scale = 4
+frame_width = 32
+frame_height = 32
+preview = [0, 0]
+"#;
+
+const SLIME_ACTIONS: &str = r#"
+default = "idle"
+
+[actions.idle]
+fps = 2
+loop = true
+duration = 6
+frames = [[0, 0], [1, 0], [0, 0], [0, 0]]
+next_random = ["walk_left", "walk_right", "walk_left", "sleep"]
+
+[actions.walk_left]
+fps = 8
+loop = true
+duration = 4
+movement = [-70, 0]
+auto_turn = true
+frames = [[0, 1], [1, 1], [2, 1], [3, 1]]
+next_random = ["idle", "idle", "sleep"]
+
+[actions.walk_right]
+fps = 8
+loop = true
+duration = 4
+movement = [70, 0]
+auto_turn = true
+frames = [[0, 2], [1, 2], [2, 2], [3, 2]]
+next_random = ["idle", "idle", "sleep"]
+
+[actions.sleep]
+fps = 1.5
+loop = true
+duration = 8
+frames = [[0, 3], [1, 3], [0, 3]]
+next = "idle"
+
+[actions.grabbed]
+fps = 1
+loop = true
+frames = [[2, 3]]
+
+[actions.fall]
+fps = 1
+loop = true
+frames = [[3, 3]]
+
+[actions.land]
+fps = 8
+loop = false
+frames = [[4, 3]]
+next = "idle"
+
+[actions.alert]
+fps = 6
+loop = false
+frames = [[3, 0], [3, 0]]
+next = "idle"
+
+[actions.tired]
+fps = 2
+loop = true
+duration = 4
+frames = [[5, 3]]
+next = "idle"
+
+[actions.celebrate]
+fps = 6
+loop = false
+frames = [[6, 3], [6, 3], [3, 0]]
+next = "idle"
+
+[actions.study]
+fps = 4
+loop = true
+duration = 12
+frames = [[2, 3], [3, 3]]
+next = "idle"
+
 [actions.petted]
 fps = 6
 loop = false
