@@ -148,6 +148,8 @@ pub struct Menu {
     pub hover: Option<usize>,
     /// (x, y, w, h) 全局坐标
     pub rect: (i32, i32, u32, u32),
+    /// 每个条目的行高（layout 时计算，hit/draw 共用）
+    row_heights: Vec<i32>,
     pub font: FontKit,
 }
 
@@ -163,18 +165,21 @@ impl Menu {
         bbox: (i32, i32, i32, i32),
         font: FontKit,
     ) -> Menu {
-        let preview_h = items
-            .iter()
-            .filter_map(|it| match it {
-                MenuItem::Skin { preview, .. } => {
-                    Some(preview.frame_h as i32 * PREVIEW_SCALE as i32)
-                }
-                _ => None,
-            })
-            .next()
-            .unwrap_or(0);
         let text_h = font.px() as i32;
-        let item_h = preview_h.max(text_h).max(10) + ITEM_PAD * 2;
+        // 行高按条目类型自适应：换肤行含预览，动作行仅文字，分隔线细条
+        let row_heights: Vec<i32> = items
+            .iter()
+            .map(|it| match it {
+                MenuItem::Skin { preview, .. } => {
+                    (preview.frame_h as i32 * PREVIEW_SCALE as i32)
+                        .max(text_h)
+                        .max(10)
+                        + ITEM_PAD * 2
+                }
+                MenuItem::Action { .. } => (text_h.max(14)) + ITEM_PAD * 2,
+                MenuItem::Separator => 9,
+            })
+            .collect();
         let width = items
             .iter()
             .map(|it| match it {
@@ -192,7 +197,7 @@ impl Menu {
             .unwrap_or(60)
             + ITEM_PAD * 2
             + BORDER * 2;
-        let height = item_h * items.len().max(1) as i32 + BORDER * 2;
+        let height: i32 = row_heights.iter().sum::<i32>() + BORDER * 2;
 
         let mut y = anchor.1 - height;
         if y < bbox.1 {
@@ -201,10 +206,10 @@ impl Menu {
         y = y.clamp(bbox.1, (bbox.3 - height).max(bbox.1));
         let x = anchor.0.clamp(bbox.0, (bbox.2 - width).max(bbox.0));
 
-        Menu { items, hover: None, rect: (x, y, width as u32, height as u32), font }
+        Menu { items, hover: None, rect: (x, y, width as u32, height as u32), row_heights, font }
     }
 
-    /// 被点击的条目索引
+    /// 被点击的条目索引（分隔线不可点击）
     pub fn hit(&self, global: (f64, f64)) -> Option<usize> {
         let (x, y, w, h) = self.rect;
         let gx = global.0 as i32;
@@ -212,9 +217,17 @@ impl Menu {
         if gx < x || gx >= x + w as i32 || gy < y || gy >= y + h as i32 {
             return None;
         }
-        let item_h = (h as i32 - BORDER * 2) / self.items.len().max(1) as i32;
-        let idx = ((gy - y - BORDER) / item_h) as usize;
-        (idx < self.items.len()).then_some(idx)
+        let mut y0 = y + BORDER;
+        for (i, rh) in self.row_heights.iter().enumerate() {
+            if gy >= y0 && gy < y0 + rh {
+                return match self.items.get(i) {
+                    Some(MenuItem::Separator) | None => None,
+                    _ => Some(i),
+                };
+            }
+            y0 += rh;
+        }
+        None
     }
 
     pub fn draw(&self, buf: &mut [u32], buf_w: usize, viewport: (i32, i32)) {
@@ -222,9 +235,9 @@ impl Menu {
         fill_rect(buf, buf_w, viewport, (mx, my, mw, mh), PANEL);
         stroke_rect(buf, buf_w, viewport, (mx, my, mw, mh), PANEL_BORDER);
 
-        let item_h = (mh as i32 - BORDER * 2) / self.items.len().max(1) as i32;
+        let mut ry = my + BORDER;
         for (i, item) in self.items.iter().enumerate() {
-            let ry = my + BORDER + item_h * i as i32;
+            let item_h = self.row_heights[i];
             match item {
                 MenuItem::Separator => {
                     fill_rect(
@@ -234,6 +247,7 @@ impl Menu {
                         (mx + BORDER + 4, ry + item_h / 2, (mw as i32 - BORDER * 2 - 8) as u32, 1),
                         PANEL_BORDER,
                     );
+                    ry += item_h;
                     continue;
                 }
                 _ => {}
@@ -263,6 +277,7 @@ impl Menu {
                         mx + BORDER + ITEM_PAD + preview.frame_w as i32 * PREVIEW_SCALE as i32 + 8;
                     let text_y = ry + (item_h - self.font.px() as i32) / 2;
                     self.font.draw_text(buf, buf_w, viewport, text_x, text_y, name, TEXT);
+                    ry += item_h;
                 }
                 MenuItem::Action { label, checked, .. } => {
                     let mut text_x = mx + BORDER + ITEM_PAD;
@@ -277,8 +292,11 @@ impl Menu {
                     }
                     let text_y = ry + (item_h - self.font.px() as i32) / 2;
                     self.font.draw_text(buf, buf_w, viewport, text_x, text_y, label, TEXT);
+                    ry += item_h;
                 }
-                MenuItem::Separator => {}
+                MenuItem::Separator => {
+                    ry += item_h;
+                }
             }
         }
     }

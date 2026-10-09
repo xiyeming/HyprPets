@@ -891,6 +891,10 @@ impl App {
                 self.mini_show();
                 "ok".into()
             }
+            "menu" => {
+                self.open_menu();
+                "ok".into()
+            }
             "skins" => assets::scan_characters()
                 .iter()
                 .map(|(n, _)| n.clone())
