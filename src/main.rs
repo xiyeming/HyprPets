@@ -666,6 +666,11 @@ impl App {
                 }
                 animated = true;
             } else {
+                // 天花板：向上抛出不越出屏幕顶，停在顶部由重力回落
+                if self.pet.y < bbox.1 {
+                    self.pet.y = bbox.1;
+                    self.physics.vy = 0.0;
+                }
                 self.pet.y = self.pet.y.min(bbox.3 - self.pet.height_px());
             }
         } else if self.drag_offset.is_none() {
