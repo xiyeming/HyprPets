@@ -89,6 +89,21 @@ hyprpet mcp list / remove <name>
 导入去重、写回 agent.toml，运行中的宠物热加载（MCP 连接自动重建）。
 hyprpet 仅支持 stdio 类型 MCP（远程 http/sse 自动跳过并提示）。
 
+## 把宠物变成其他 agent 的 MCP 工具（反向接入）
+
+`hyprpet mcp serve` 把宠物本身变成 MCP server（stdio），暴露 say/act/move_to/
+skin/mini/hide/show/menu/skins 九个工具，其他 agent 就能原生指挥桌宠：
+
+```bash
+hyprpet mcp setup all        # 一键注册到全部 agent（claude-code/claude-desktop/
+                             # codex/pi/opencode/chatgpt-desktop/gemini/cursor/vscode）
+hyprpet mcp setup claude-code   # 或单个
+hyprpet mcp export all          # 把 hyprpet 的 [[mcp]] 列表推送到其他 agent 配置
+```
+
+注册使用当前二进制绝对路径，JSON/TOML 合并且保留已有配置。重启对应 agent 后，
+Claude Code 里就能调用 `say` 让宠物播报任务结果、Codex 里能 `act celebrate` 庆祝构建成功。
+
 内置工具：`get_system_status`、`set_timer`、`get_clipboard`、`run_command`（白名单），以及所有已配置 MCP server 的工具。
 
 ## 行为配置（~/.config/hyprpet/config.toml）

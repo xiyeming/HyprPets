@@ -23,8 +23,8 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 rodio = { version = "0.21", default-features = false, features = ["playback", "wav"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 sysinfo = "0.37"
-rmcp = { version = "0.8", features = ["client", "transport-child-process"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "process", "io-util", "sync", "time", "macros"] }
+rmcp = { version = "0.8", features = ["client", "transport-child-process", "transport-io", "schemars"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "process", "io-util", "io-std", "sync", "time", "macros"] }
 wayland-protocols = { version = "0.32", features = ["unstable", "staging"] }
 ksni = { version = "0.3", features = ["blocking"] }
 

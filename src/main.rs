@@ -16,6 +16,7 @@ mod builtin_cat;
 mod builtin_slime;
 mod chat;
 mod cli;
+mod mcp_serve;
 mod settings;
 mod tray;
 mod fsm;

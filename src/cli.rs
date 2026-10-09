@@ -32,9 +32,185 @@ pub fn mcp_main(args: &[String]) -> i32 {
         "remove" | "rm" => cmd_remove(args.get(1..).unwrap_or(&[])),
         "list" | "ls" => cmd_list(),
         "import" => cmd_import(args.get(1).map(|s| s.as_str()).unwrap_or("all")),
+        "serve" => crate::mcp_serve::serve(),
+        "setup" => cmd_setup(args.get(1).map(|s| s.as_str()).unwrap_or("")),
+        "export" => cmd_export(args.get(1).map(|s| s.as_str()).unwrap_or("all")),
         _ => {
             usage();
             2
+        }
+    }
+}
+
+/// 可注册的目标 agent
+const SETUP_TARGETS: &[(&str, &str)] = &[
+    ("claude-code", "~/.claude.json"),
+    ("claude-desktop", "~/.claude/claude_desktop_config.json"),
+    ("pi", "~/.pi/agent/mcp.json"),
+    ("chatgpt", "~/.chatgpt/mcp_settings.json"),
+    ("gemini", "~/.gemini/settings.json"),
+    ("cursor", "~/.cursor/mcp.json"),
+    ("opencode", "~/.config/opencode/opencode.json"),
+];
+
+/// hyprpet mcp setup <agent>：把「hyprpet mcp serve」注册为指定 agent 的 MCP server
+fn cmd_setup(target: &str) -> i32 {
+    if target.is_empty() || target == "all" {
+        println!("目标: {}", SETUP_TARGETS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(" / "));
+        println!("codex 与 vscode 请用: hyprpet mcp export codex|vscode");
+        for (name, _) in SETUP_TARGETS {
+            if cmd_setup(name) != 0 {
+                return 1;
+            }
+        }
+        let _ = cmd_setup_codex();
+        return 0;
+    }
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "hyprpet".into());
+    let args = vec!["mcp".to_string(), "serve".to_string()];
+
+    match target {
+        "codex" => return cmd_setup_codex(),
+        "vscode" => {
+            let path = std::path::PathBuf::from(".vscode/mcp.json");
+            let r = merge_json(&path, &["servers", "hyprpet"], &serde_json::json!({
+                "command": exe, "args": args }));
+            return report(r, &format!(".vscode/mcp.json（{:?}）", std::env::current_dir().ok()));
+        }
+        _ => {}
+    }
+    let Some((_, path)) = SETUP_TARGETS.iter().find(|(n, _)| *n == target) else {
+        eprintln!("未知目标 {target}，可选: all / {}", SETUP_TARGETS.iter().map(|(n,_)|*n).collect::<Vec<_>>().join(" / "));
+        return 2;
+    };
+    let path = expand_home(path);
+    if target == "opencode" {
+        let r = merge_json(&path, &["mcp", "hyprpet"], &serde_json::json!({
+            "type": "local", "command": [exe, "mcp", "serve"] }));
+        report(r, &format!("{}", path.display()))
+    } else {
+        let r = merge_json(&path, &["mcpServers", "hyprpet"], &serde_json::json!({
+            "command": exe, "args": args }));
+        report(r, &format!("{}", path.display()))
+    }
+}
+
+fn cmd_setup_codex() -> i32 {
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "hyprpet".into());
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let path = home.join(".codex/config.toml");
+    let mut v: toml::Value = std::fs::read_to_string(&path).ok().and_then(|s| s.parse().ok()).unwrap_or(toml::Value::Table(toml::map::Map::new()));
+    let entry = toml::Value::Table(toml::map::Map::from_iter([
+        ("command".to_string(), toml::Value::String(exe)),
+        ("args".to_string(), toml::Value::Array(vec!["mcp".into(), "serve".into()])),
+    ]));
+    toml_set(&mut v, &["mcp_servers", "hyprpet"], entry);
+    match std::fs::write(&path, v.to_string()) {
+        Ok(_) => { println!("已注册到 {}", path.display()); 0 }
+        Err(e) => { eprintln!("写入 {} 失败: {e}", path.display()); 1 }
+    }
+}
+
+/// hyprpet mcp export <agent|all>：把本机 agent.toml 的 [[mcp]] 列表推送到其他 agent 配置
+fn cmd_export(target: &str) -> i32 {
+    let cfg = AgentConfig::load();
+    if cfg.mcp.is_empty() {
+        println!("hyprpet 未配置 MCP server（先 hyprpet mcp add）");
+        return 0;
+    }
+    let targets: Vec<(&str, &str)> = if target == "all" {
+        SETUP_TARGETS.to_vec()
+    } else {
+        match SETUP_TARGETS.iter().find(|(n, _)| *n == target) {
+            Some(t) => vec![*t],
+            None => {
+                eprintln!("未知目标 {target}");
+                return 2;
+            }
+        }
+    };
+    for (name, path) in targets {
+        let path = expand_home(path);
+        for m in &cfg.mcp {
+            let r = merge_json(&path, &["mcpServers", &m.name], &serde_json::json!({
+                "command": m.command, "args": m.args }));
+            if r.is_err() {
+                eprintln!("[{name}] 写入 {} 失败: {}", path.display(), r.err().unwrap());
+            }
+        }
+        println!("[{name}] 已写入 {}（{} 个 server）", path.display(), cfg.mcp.len());
+    }
+    if target == "all" || target == "codex" {
+        // codex 用 TOML
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let path = home.join(".codex/config.toml");
+        let mut v: toml::Value = std::fs::read_to_string(&path).ok().and_then(|s| s.parse().ok()).unwrap_or(toml::Value::Table(toml::map::Map::new()));
+        for m in &cfg.mcp {
+            let entry = toml::Value::Table(toml::map::Map::from_iter([
+                ("command".to_string(), toml::Value::String(m.command.clone())),
+                ("args".to_string(), toml::Value::Array(m.args.iter().map(|a| a.as_str().into()).collect())),
+            ]));
+            toml_set(&mut v, &["mcp_servers", &m.name], entry);
+        }
+        let _ = std::fs::write(&path, v.to_string());
+        println!("[codex] 已写入 {}", path.display());
+    }
+    0
+}
+
+fn expand_home(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest)
+    } else {
+        PathBuf::from(p)
+    }
+}
+
+/// JSON 合并：在指定路径（逐层对象）写入 entry
+fn merge_json(path: &std::path::Path, keys: &[&str], entry: &serde_json::Value) -> Result<(), String> {
+    let mut v: serde_json::Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::json!({}));
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let mut cur = &mut v;
+    for k in keys.iter().take(keys.len().saturating_sub(1)) {
+        if !cur.get(*k).map(|x| x.is_object()).unwrap_or(false) {
+            cur.as_object_mut().unwrap().insert((*k).to_string(), serde_json::json!({}));
+        }
+        cur = cur.get_mut(*k).unwrap();
+    }
+    let last = keys.last().ok_or("空路径")?;
+    cur.as_object_mut().unwrap().insert((*last).to_string(), entry.clone());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+fn toml_set(v: &mut toml::Value, keys: &[&str], val: toml::Value) {
+    if keys.is_empty() {
+        *v = val;
+        return;
+    }
+    if !v.is_table() {
+        *v = toml::Value::Table(toml::map::Map::new());
+    }
+    let e = v.as_table_mut().unwrap().entry(keys[0]).or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    toml_set(e, &keys[1..], val);
+}
+
+fn report(r: Result<(), String>, where_: &str) -> i32 {
+    match r {
+        Ok(_) => {
+            println!("已注册到 {where_}（重启该 agent 生效）");
+            0
+        }
+        Err(e) => {
+            eprintln!("写入 {where_} 失败: {e}");
+            1
         }
     }
 }
