@@ -25,7 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 sysinfo = "0.37"
 rmcp = { version = "0.8", features = ["client", "transport-child-process"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "process", "io-util", "sync", "time", "macros"] }
-wayland-protocols = { version = "0.32", features = ["unstable"] }
+wayland-protocols = { version = "0.32", features = ["unstable", "staging"] }
 
 [profile.release]
 opt-level = 2

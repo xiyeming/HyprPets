@@ -80,6 +80,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/docs"]
 
 内置工具：`get_system_status`、`set_timer`、`get_clipboard`、`run_command`（白名单），以及所有已配置 MCP server 的工具。
 
+## 行为配置（~/.config/hyprpet/config.toml）
+
+
+
+修改保存后自动热生效。
+
 ## 角色格式
 
 ```text

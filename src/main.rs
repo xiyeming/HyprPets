@@ -55,6 +55,8 @@ use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{self, ExtIdleNotificationV1};
+use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{self, ZwpTextInputV3};
 
 use crate::agent::{AgentEvent, AgentRequest};
@@ -70,6 +72,39 @@ use crate::ui::{Bubble, FontKit, Menu, MenuEntry};
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+
+/// config.toml 根结构
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+struct PetConfig {
+    behavior: BehaviorConfig,
+}
+
+/// 行为配置（~/.config/hyprpet/config.toml 的 [behavior] 表）
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+struct BehaviorConfig {
+    /// 无电脑活动多少秒后才允许自主移动
+    move_after_idle_seconds: u64,
+}
+
+impl Default for BehaviorConfig {
+    fn default() -> Self {
+        BehaviorConfig { move_after_idle_seconds: 120 }
+    }
+}
+
+impl BehaviorConfig {
+    fn load() -> BehaviorConfig {
+        let path = assets::characters_dir().join("../config.toml");
+        let path = path.canonicalize().unwrap_or(path);
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| toml::from_str::<PetConfig>(&s).ok())
+            .map(|c| c.behavior)
+            .unwrap_or_default()
+    }
+}
 
 /// 来自信号线程 / 文件监视器的事件
 enum ControlEvent {
@@ -122,6 +157,12 @@ struct App {
     agent_tx: Option<std::sync::mpsc::Sender<AgentRequest>>,
     timers: Vec<(Instant, String)>,
     /// text-input-v3（IME 输入）
+    behavior: BehaviorConfig,
+    seat: Option<WlSeat>,
+    idle_notifier: Option<ExtIdleNotifierV1>,
+    idle_notification: Option<ExtIdleNotificationV1>,
+    /// 用户是否处于活动状态（false = 已空闲，宠物可漫游）
+    user_active: bool,
     ti_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
     ti_entered: bool,
@@ -282,6 +323,9 @@ impl App {
             return;
         }
         self.last_reload = Instant::now();
+        // 行为配置热重载
+        self.behavior = BehaviorConfig::load();
+        self.recreate_idle_notification();
         let Some(dir) = self.character.as_ref().map(|c| c.dir.clone()) else {
             return;
         };
@@ -929,9 +973,15 @@ impl App {
                     }
                 }
 
-                // FSM 驱动的位移（行走）
+                // FSM 驱动的位移（行走）：仅在用户空闲时允许
                 if let Some([mx, my]) = def.movement {
-                    let evading = self.evading();
+                    let evading = self.evading() || self.user_active;
+                    if self.user_active && !evading {
+                        // 活动状态强制 idle（停止漫游）
+                        if self.set_action("idle") {
+                            animated = true;
+                        }
+                    }
                     if !evading {
                         let old_x = self.pet.x;
                         self.pet.x = (self.pet.x as f32 + mx * dt).round() as i32;
@@ -1301,13 +1351,24 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {}
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: WlSeat) {
+        if self.seat.is_none() {
+            self.seat = Some(seat.clone());
+            self.recreate_idle_notification();
+        }
+    }
 
     fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {
         self.pointer = None;
     }
 
     fn new_capability(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: WlSeat, capability: Capability) {
+        // 初始 seat 的 new_seat 回调不会触发（SCTK 0.19 行为），
+        // 在 capability 到达时存 seat 并创建空闲通知
+        if self.seat.is_none() {
+            self.seat = Some(seat.clone());
+            self.recreate_idle_notification();
+        }
         if capability == Capability::Pointer && self.pointer.is_none() {
             match self.seat_state.get_pointer(qh, &seat) {
                 Ok(pointer) => self.pointer = Some(pointer),
@@ -1627,6 +1688,48 @@ impl LayerShellHandler for App {
     }
 }
 
+impl App {
+    /// 按配置的阈值重建空闲通知（配置热更新用）
+    fn recreate_idle_notification(&mut self) {
+        let (Some(notifier), Some(seat)) = (&self.idle_notifier, &self.seat) else { return };
+        if let Some(old) = self.idle_notification.take() {
+            old.destroy();
+        }
+        let timeout_ms = (self.behavior.move_after_idle_seconds.max(1)) as u32 * 1000;
+        self.idle_notification =
+            Some(notifier.get_idle_notification(timeout_ms, seat, &self.qh, ()));
+        eprintln!("[hyprpet] 空闲漫游阈值: {}s", self.behavior.move_after_idle_seconds);
+    }
+}
+
+/// ext-idle-notify-v1：合成器报告全局输入空闲状态
+impl Dispatch<ExtIdleNotificationV1, ()> for App {
+    fn event(
+        data: &mut App,
+        _: &ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => {
+                data.user_active = false;
+            }
+            ext_idle_notification_v1::Event::Resumed => {
+                data.user_active = true;
+                // 活动恢复：立即停止漫游
+                if data.set_action("idle") {
+                    data.needs_redraw = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(App: ignore ExtIdleNotifierV1);
+
 impl Dispatch<ZwpTextInputV3, ()> for App {
     fn event(
         data: &mut App,
@@ -1820,6 +1923,12 @@ fn main() -> Result<()> {
     let ti_manager = globals
         .bind::<ZwpTextInputManagerV3, App, ()>(&qh, 1..=1, ())
         .ok();
+    let idle_notifier = match globals
+        .bind::<ExtIdleNotifierV1, App, ()>(&qh, 1..=1, ())
+    {
+        Ok(n) => Some(n),
+        Err(_) => None,
+    };
 
     let mut app = App {
         qh: qh.clone(),
@@ -1847,6 +1956,11 @@ fn main() -> Result<()> {
         last_sense: Instant::now() - std::time::Duration::from_secs(120),
         sense_acc: 0.0,
         cursor_acc: 0.0,
+        behavior: BehaviorConfig::load(),
+        seat: None,
+        idle_notifier,
+        idle_notification: None,
+        user_active: true,
         normal_scale: args.scale.unwrap_or(4),
         mini_scale: 2,
         mini_anchor: None,
@@ -2026,8 +2140,12 @@ fn main() -> Result<()> {
         notify::Config::default(),
     ) {
         Ok(mut watcher) => {
-            if let Err(e) = watcher.watch(&assets::characters_dir(), RecursiveMode::Recursive) {
-                eprintln!("[hyprpet] 监视角色目录失败: {e}");
+            let watch_dir = assets::characters_dir()
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(assets::characters_dir);
+            if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::Recursive) {
+                eprintln!("[hyprpet] 监视配置目录失败: {e}");
             } else {
                 app.watcher = Some(watcher);
             }
