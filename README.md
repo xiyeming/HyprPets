@@ -206,6 +206,10 @@ echo "state done 构建成功！"  | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hyprp
 
 典型工作流：任务开始 `status working` → 完成 `status done`（蹦跳庆祝）→ 异常 `status error` → 等你确认 `status confirm`。
 
+**自动联动（零配置）**：宠物每 3s 监视 pi/claude/codex/cursor-agent/gemini/opencode/copilot
+进程树的 CPU——活跃即 `working`（蓝点+陪读），静止 12s 转 `thinking`（黄点，等模型响应），
+进程退出且曾活跃 → `done` 庆祝。手动设置的 warning/error/confirm 不被自动逻辑覆盖。
+
 ## 外部控制 socket
 
 任何脚本 / agent / CI 可通过 `$XDG_RUNTIME_DIR/hyprpet.sock` 一行命令指挥宠物：

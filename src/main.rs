@@ -239,6 +239,13 @@ struct App {
     layer_shell: LayerShell,
     /// agent 语义状态（头顶状态点 + 动作 + 音效）
     agent_status: Option<AgentStatus>,
+    /// 状态是否为自动监视设置（手动 warning/error/confirm 不被自动逻辑覆盖）
+    agent_status_auto: bool,
+    /// 受监视 agent 进程树 CPU 采样
+    agent_watch: Vec<(u32, String, u64, bool)>,  // (pid, name, 累计ticks, 上轮活跃)
+    /// agent 无 CPU 活动起始时间
+    agent_quiet_since: Option<Instant>,
+    agent_watch_acc: f32,
     /// 系统托盘句柄
     tray_handle: Option<ksni::blocking::Handle<tray::PetTray>>,
     /// 保持文件监视器存活
@@ -677,6 +684,132 @@ impl App {
         }
     }
 
+    /// 读取进程自身 utime+stime（clock ticks）
+    fn proc_ticks(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let after = match stat.rfind(')') { Some(i) => &stat[i + 2..], None => return 0 };
+        let f: Vec<&str> = after.split_whitespace().collect();
+        // f[0]=state, f[11]=utime(第14字段), f[12]=stime(第15字段)
+        f.get(11).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+            + f.get(12).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+    }
+
+    /// 进程树（含子进程，深度 2）总 ticks
+    fn tree_ticks(pid: u32) -> u64 {
+        let mut total = Self::proc_ticks(pid);
+        if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+            for c in children.split_whitespace() {
+                let c: u32 = match c.parse() { Ok(v) => v, Err(_) => continue };
+                total += Self::proc_ticks(c);
+                if let Ok(gc) = std::fs::read_to_string(format!("/proc/{c}/task/{c}/children")) {
+                    for g in gc.split_whitespace() {
+                        if let Ok(g) = g.parse::<u32>() {
+                            total += Self::proc_ticks(g);
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// 自动 agent 监视：CPU 活跃 → working；安静 → thinking/清除；退出 → done
+    fn update_agent_watch(&mut self) {
+        const WATCH_COMMS: [&str; 7] = ["pi", "claude", "codex", "cursor-agent", "gemini", "opencode", "copilot"];
+        const ACTIVE_TICKS: u64 = 15; // 3s 采样窗内 ≥0.15s CPU = 活跃
+
+        // 发现受监视进程
+        let mut found: Vec<(u32, String)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let pid_ok = name.to_string_lossy().chars().all(|c| c.is_ascii_digit());
+                if !pid_ok { continue; }
+                let pid: u32 = match name.to_string_lossy().parse() { Ok(p) => p, Err(_) => continue };
+                if std::fs::read(e.path().join("comm")).map(|c| {
+                    let c = String::from_utf8_lossy(&c).trim().to_string();
+                    WATCH_COMMS.iter().any(|w| c == *w)
+                }).unwrap_or(false) {
+                    found.push((pid, String::new()));
+                }
+            }
+        }
+
+        // 进程消失且曾活跃 → done 庆祝（仅当当前是自动状态）
+        let gone_active = self.agent_watch.iter().any(|(pid, _, _, was_active)| {
+            *was_active && !found.iter().any(|(p, _)| p == pid)
+        });
+        if gone_active && self.agent_status_auto
+            && matches!(self.agent_status.as_ref().map(|s| s.kind),
+                Some(StatusKind::Working) | Some(StatusKind::Thinking) | None)
+        {
+            self.set_agent_status_ex("done", "", true, true);
+        }
+        self.agent_watch.retain(|(pid, _, _, _)| found.iter().any(|(p, _)| p == pid));
+
+        // 新发现的进程加入监视（下轮采样才有 delta）
+        for (pid, name) in &found {
+            if !self.agent_watch.iter().any(|(p, _, _, _)| p == pid) {
+                self.agent_watch.push((*pid, name.clone(), Self::tree_ticks(*pid), false));
+            }
+        }
+
+        // 更新 ticks
+        let mut any_active = false;
+        for (pid, _, ticks, active) in &mut self.agent_watch {
+            let now_ticks = Self::tree_ticks(*pid);
+            let delta = now_ticks.saturating_sub(*ticks);
+            *ticks = now_ticks;
+            *active = delta >= ACTIVE_TICKS;
+            any_active |= *active;
+        }
+
+        // 状态机（不打扰手动 warning/error/confirm/done）
+        let manual_hold = matches!(self.agent_status.as_ref().map(|s| s.kind),
+            Some(StatusKind::Warning) | Some(StatusKind::Error) | Some(StatusKind::Confirm))
+            && !self.agent_status_auto;
+        if manual_hold { return; }
+
+        let cur = self.agent_status.as_ref().map(|s| s.kind);
+        if any_active {
+            self.agent_quiet_since = None;
+            if cur != Some(StatusKind::Working) {
+                // 开始干活（或从 thinking 升级）
+                self.set_agent_status_ex("working", "", cur.is_none(), true);
+            }
+        } else {
+            let quiet_long = self.agent_quiet_since
+                .map(|t| t.elapsed() > std::time::Duration::from_secs(12))
+                .unwrap_or(false);
+            match cur {
+                Some(StatusKind::Working) => {
+                    if self.agent_quiet_since.is_none() {
+                        self.agent_quiet_since = Some(Instant::now());
+                    } else if quiet_long {
+                        // 仍在等模型响应 → thinking；彻底无进程 → 清除
+                        if !self.agent_watch.is_empty() {
+                            self.set_agent_status_ex("thinking", "", false, true);
+                        } else {
+                            self.agent_status = None;
+                            self.agent_status_auto = false;
+                            self.needs_redraw = true;
+                        }
+                        self.agent_quiet_since = None;
+                    }
+                }
+                Some(StatusKind::Thinking) => {
+                    if self.agent_watch.is_empty() || quiet_long {
+                        self.agent_status = None;
+                        self.agent_status_auto = false;
+                        self.needs_redraw = true;
+                        self.agent_quiet_since = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 系统状态感知：高负载 → tired；检测到编码进程 → study
     fn system_sense(&mut self, now: Instant) {
         if self.physics.active || self.drag_offset.is_some() || self.chat.is_some() {
@@ -882,6 +1015,11 @@ impl App {
 
     /// agent 状态联动：状态点 + 动作 + 音效 + 气泡
     fn set_agent_status(&mut self, kind_str: &str, text: &str) {
+        self.set_agent_status_ex(kind_str, text, true, false);
+    }
+
+    /// notify=false 时静默（无音效/气泡/动作，仅状态点），auto=true 标记自动状态
+    fn set_agent_status_ex(&mut self, kind_str: &str, text: &str, notify: bool, auto: bool) {
         let kind = match kind_str {
             "thinking" | "think" => StatusKind::Thinking,
             "working" | "work" => StatusKind::Working,
@@ -899,6 +1037,7 @@ impl App {
                 return;
             }
         };
+        self.agent_status_auto = auto;
         let (sound, action, default_text, color) = match kind {
             StatusKind::Thinking => ("pop", "study", "🤔 思考中…", 0xFFF5C966u32),
             StatusKind::Working => ("pop", "study", "⚙️ 工作中…", 0xFF6AA6FF),
@@ -909,12 +1048,14 @@ impl App {
         };
         let _ = color;
         let text = if text.is_empty() { default_text } else { text };
-        audio::play_named(&self.audio, sound);
-        self.set_action(action);
-        self.bubble = Some(Bubble {
-            text: text.chars().take(60).collect(),
-            until: Instant::now() + std::time::Duration::from_secs(4),
-        });
+        if notify {
+            audio::play_named(&self.audio, sound);
+            self.set_action(action);
+            self.bubble = Some(Bubble {
+                text: text.chars().take(60).collect(),
+                until: Instant::now() + std::time::Duration::from_secs(4),
+            });
+        }
         self.agent_status = Some(AgentStatus { kind, text: text.to_string(), since: Instant::now() });
         self.needs_redraw = true;
     }
@@ -1345,8 +1486,16 @@ impl App {
         if let Some(st) = &self.agent_status {
             if st.kind == StatusKind::Done && st.since.elapsed() > std::time::Duration::from_secs(6) {
                 self.agent_status = None;
+                self.agent_status_auto = false;
                 self.needs_redraw = true;
             }
+        }
+
+        // agent 进程自动监视（3s 采样，独立于感知冷却）
+        self.agent_watch_acc += dt;
+        if self.agent_watch_acc >= 3.0 {
+            self.agent_watch_acc = 0.0;
+            self.update_agent_watch();
         }
 
         let Some(bbox) = self.layout_bbox() else { return };
@@ -2698,6 +2847,10 @@ fn main() -> Result<()> {
         cursor_acc: 0.0,
         tray_handle: None,
         agent_status: None,
+        agent_status_auto: false,
+        agent_watch: Vec::new(),
+        agent_quiet_since: None,
+        agent_watch_acc: 0.0,
         behavior: BehaviorConfig::load(),
         seat: None,
         idle_notifier,
