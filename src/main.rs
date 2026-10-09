@@ -118,6 +118,59 @@ enum ControlEvent {
     Quit,
 }
 
+/// 收边探头状态机相位
+#[derive(Clone, Copy, PartialEq)]
+enum PeekPhase {
+    /// 滑入边缘（anchor → tucked）
+    HideSlide,
+    /// 藏好等待，随机时长后探头
+    Tucked,
+    /// 向外探出（tucked → peek）
+    OutSlide,
+    /// 探出张望，随机时长后缩回
+    Peek,
+    /// 缩回（peek → tucked）
+    InSlide,
+    /// 用户触发弹出（当前位置 → anchor）
+    ShowSlide,
+}
+
+/// 收边探头状态：藏入边缘后周期性探出半张脸张望
+struct EdgePeek {
+    phase: PeekPhase,
+    t: f32,
+    /// Tucked / Peek 的目标停留时长
+    wait: f32,
+    from: (i32, i32),
+    tucked: (i32, i32),
+    peek: (i32, i32),
+    anchor: (i32, i32),
+}
+
+fn ease_out(k: f32) -> f32 {
+    1.0 - (1.0 - k) * (1.0 - k)
+}
+
+fn ease_in(k: f32) -> f32 {
+    k * k
+}
+
+fn lerp_pos(a: (i32, i32), b: (i32, i32), k: f32) -> (i32, i32) {
+    (
+        (a.0 as f32 + (b.0 - a.0) as f32 * k).round() as i32,
+        (a.1 as f32 + (b.1 - a.1) as f32 * k).round() as i32,
+    )
+}
+
+/// 简易随机（时间种子），避免引入 rand 依赖
+fn rnd_range(min: f32, max: f32) -> f32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 16))
+        .unwrap_or(0);
+    min + (nanos % 1000) as f32 / 1000.0 * (max - min)
+}
+
 /// 一个显示器对应的 layer surface 及其状态
 struct PetSurface {
     output: WlOutput,
@@ -177,8 +230,8 @@ struct App {
     /// mini 模式：进入前的缩放（恢复用）
     normal_scale: u32,
     mini_scale: u32,
-    /// 收边隐藏：收起前的位置（弹出恢复用）
-    mini_anchor: Option<(i32, i32)>,
+    /// 收边探头状态机（Some = 已收边）
+    edge_peek: Option<EdgePeek>,
     /// 左键按下起点（单击判定）
     press_start: Option<(f64, f64)>,
     /// 双击检测：上次左键按下的时间与位置
@@ -353,11 +406,17 @@ impl App {
     fn save_current_character(&self) {
         let Some(c) = &self.character else { return };
         let name = c.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // 收边隐藏中保存恢复位置（anchor），避免重启后宠物卡在边缘
+        let (sx, sy) = self
+            .edge_peek
+            .as_ref()
+            .map(|ep| ep.anchor)
+            .unwrap_or((self.pet.x, self.pet.y));
         let state = format!(
             "current = \"{name}\"\nmode = \"{mode}\"\nx = {x}\ny = {y}\n",
             mode = if self.pet.is_mini() { "mini" } else { "normal" },
-            x = self.pet.x,
-            y = self.pet.y
+            x = sx,
+            y = sy
         );
         let path = assets::characters_dir().join("state.toml");
         std::fs::write(path, state).ok();
@@ -487,6 +546,80 @@ impl App {
         if self.sense_acc >= 5.0 {
             self.sense_acc = 0.0;
             self.system_sense(now);
+        }
+    }
+
+    /// 收边探头状态机：藏入 → 随机等待 → 探出张望 → 缩回，循环
+    fn tick_peek(&mut self, dt: f32) {
+        let (mut new_pos, mut finished, mut action) = (None, false, None);
+        if let Some(ep) = &mut self.edge_peek {
+            ep.t += dt;
+            match ep.phase {
+                PeekPhase::HideSlide => {
+                    let k = (ep.t / 0.35).min(1.0);
+                    new_pos = Some(lerp_pos(ep.from, ep.tucked, ease_out(k)));
+                    if k >= 1.0 {
+                        ep.phase = PeekPhase::Tucked;
+                        ep.t = 0.0;
+                        ep.wait = rnd_range(2.5, 7.0);
+                    }
+                }
+                PeekPhase::Tucked => {
+                    if ep.t >= ep.wait {
+                        ep.phase = PeekPhase::OutSlide;
+                        ep.t = 0.0;
+                    }
+                }
+                PeekPhase::OutSlide => {
+                    let k = (ep.t / 0.4).min(1.0);
+                    new_pos = Some(lerp_pos(ep.tucked, ep.peek, ease_out(k)));
+                    if k >= 1.0 {
+                        ep.phase = PeekPhase::Peek;
+                        ep.t = 0.0;
+                        ep.wait = rnd_range(1.2, 2.6);
+                        action = Some("alert");
+                    }
+                }
+                PeekPhase::Peek => {
+                    if ep.t >= ep.wait {
+                        ep.phase = PeekPhase::InSlide;
+                        ep.t = 0.0;
+                        action = Some("idle");
+                    }
+                }
+                PeekPhase::InSlide => {
+                    let k = (ep.t / 0.3).min(1.0);
+                    new_pos = Some(lerp_pos(ep.peek, ep.tucked, ease_in(k)));
+                    if k >= 1.0 {
+                        ep.phase = PeekPhase::Tucked;
+                        ep.t = 0.0;
+                        ep.wait = rnd_range(2.5, 7.0);
+                    }
+                }
+                PeekPhase::ShowSlide => {
+                    let k = (ep.t / 0.4).min(1.0);
+                    new_pos = Some(lerp_pos(ep.from, ep.anchor, ease_out(k)));
+                    if k >= 1.0 {
+                        finished = true;
+                    }
+                }
+            }
+        }
+        if let Some(p) = new_pos {
+            self.pet.x = p.0;
+            self.pet.y = p.1;
+            self.needs_redraw = true;
+        }
+        if let Some(a) = action {
+            self.set_action(a);
+        }
+        if finished {
+            self.edge_peek = None;
+            if let Some(b) = self.layout_bbox() {
+                self.pet.clamp_to(b.0, b.1, b.2, b.3);
+            }
+            self.region_dirty = true;
+            self.save_current_character();
         }
     }
 
@@ -722,10 +855,16 @@ impl App {
                 if fullscreen {
                     region.add(0, 0, s.size.0 as i32, s.size.1 as i32);
                 } else {
-                    let x0 = self.pet.x.max(s.origin.0);
-                    let y0 = self.pet.y.max(s.origin.1);
-                    let x1 = (self.pet.x + self.pet.width_px()).min(s.origin.0 + s.size.0 as i32);
-                    let y1 = (self.pet.y + self.pet.height_px()).min(s.origin.1 + s.size.1 as i32);
+                    // 收边隐藏：region 覆盖探头位置（探出时露出的脸可点击）
+                    let (px, py) = self
+                        .edge_peek
+                        .as_ref()
+                        .map(|ep| ep.peek)
+                        .unwrap_or((self.pet.x, self.pet.y));
+                    let x0 = px.max(s.origin.0);
+                    let y0 = py.max(s.origin.1);
+                    let x1 = (px + self.pet.width_px()).min(s.origin.0 + s.size.0 as i32);
+                    let y1 = (py + self.pet.height_px()).min(s.origin.1 + s.size.1 as i32);
                     if x0 < x1 && y0 < y1 {
                         region.add(x0 - s.origin.0, y0 - s.origin.1, x1 - x0, y1 - y0);
                     }
@@ -752,7 +891,7 @@ impl App {
         if self.pet.is_mini() {
             self.pet.mode = PetMode::Normal;
             self.pet.scale = self.normal_scale.max(1);
-            self.mini_anchor = None;
+            self.edge_peek = None;
         } else {
             self.close_chat();
             self.pet.mode = PetMode::Mini;
@@ -770,57 +909,70 @@ impl App {
         eprintln!("[hyprpet] 模式: {}", if self.pet.is_mini() { "mini" } else { "正常" });
     }
 
-    /// 收进最近的屏幕边缘（只留 6px 把手）；非 mini 自动先进入 mini
+    /// 收进最近的屏幕边缘：滑入动画 + 周期性探头偷看；非 mini 自动先进入 mini
     fn mini_hide(&mut self) {
         if !self.pet.is_mini() {
             self.toggle_mini();
         }
+        if self.edge_peek.is_some() {
+            return;
+        }
         let cx = self.pet.x + self.pet.width_px() / 2;
         let Some(m) = self.monitor_rect_of(cx) else { return };
-        if self.mini_anchor.is_none() {
-            self.mini_anchor = Some((self.pet.x, self.pet.y));
-        }
         const TAB: i32 = 6;
+        /// 探头时露出的比例
+        const PEEK_RATIO: f32 = 0.55;
         let (w, h) = (self.pet.width_px(), self.pet.height_px());
-        let (dl, dr, dt, db) = (cx - m.0, m.2 - cx, 0, 0);
         let cy = self.pet.y + h / 2;
-        let (dt2, db2) = (cy - m.1, m.3 - cy);
-        let min = dl.min(dr).min(dt2).min(db2);
-        if min == dl {
-            self.pet.x = m.0 - w + TAB;
+        let dl = cx - m.0;
+        let dr = m.2 - cx;
+        let dt = cy - m.1;
+        let db = m.3 - cy;
+        let min = dl.min(dr).min(dt).min(db);
+        let pw = (w as f32 * PEEK_RATIO) as i32;
+        let ph = (h as f32 * PEEK_RATIO) as i32;
+        let (tucked, peek) = if min == dl {
+            ((m.0 - w + TAB, self.pet.y), (m.0 - w + pw, self.pet.y))
         } else if min == dr {
-            self.pet.x = m.2 - TAB;
-        } else if min == dt2 {
-            self.pet.y = m.1 - h + TAB;
+            ((m.2 - TAB, self.pet.y), (m.2 - pw, self.pet.y))
+        } else if min == dt {
+            ((self.pet.x, m.1 - h + TAB), (self.pet.x, m.1 - h + ph))
         } else {
-            self.pet.y = m.3 - TAB;
-        }
+            ((self.pet.x, m.3 - TAB), (self.pet.x, m.3 - ph))
+        };
+        self.edge_peek = Some(EdgePeek {
+            phase: PeekPhase::HideSlide,
+            t: 0.0,
+            wait: 0.0,
+            from: (self.pet.x, self.pet.y),
+            tucked,
+            peek,
+            anchor: (self.pet.x, self.pet.y),
+        });
         self.region_dirty = true;
         self.needs_redraw = true;
         self.save_current_character();
     }
 
-    /// 从边缘弹出（恢复原位，无记录则屏内居中下）
+    /// 从边缘弹出：滑回原位（动画）
     fn mini_show(&mut self) {
         if !self.pet.is_mini() {
             return;
         }
-        if let (Some((x, y)), Some(b)) = (self.mini_anchor, self.layout_bbox()) {
-            self.pet.x = x;
-            self.pet.y = y;
-            self.pet.clamp_to(b.0, b.1, b.2, b.3);
+        if let Some(ep) = &mut self.edge_peek {
+            ep.from = (self.pet.x, self.pet.y);
+            ep.phase = PeekPhase::ShowSlide;
+            ep.t = 0.0;
         } else if let Some(b) = self.layout_bbox() {
             self.pet.x = (b.0 + b.2) / 2 - self.pet.width_px() / 2;
             self.pet.y = b.3 - self.pet.height_px() - 60;
+            self.region_dirty = true;
+            self.needs_redraw = true;
         }
-        self.mini_anchor = None;
-        self.region_dirty = true;
-        self.needs_redraw = true;
-        self.save_current_character();
     }
 
     fn mini_hidden(&self) -> bool {
-        self.pet.is_mini() && self.mini_anchor.is_some()
+        self.edge_peek.is_some()
     }
 
     // ---------- 外部控制（agent 联动） ----------
@@ -862,6 +1014,9 @@ impl App {
                 };
                 self.pet.x = x;
                 self.pet.y = y;
+                if self.edge_peek.is_some() {
+                    self.edge_peek = None;
+                }
                 if let Some(b) = self.layout_bbox() {
                     self.pet.clamp_to(b.0, b.1, b.2, b.3);
                 }
@@ -1018,6 +1173,7 @@ impl App {
             if animated {
                 self.needs_redraw = true;
             }
+            self.tick_peek(dt);
             self.tick_timers_bubble_cursor(dt, now);
             return;
         }
@@ -2106,7 +2262,7 @@ fn main() -> Result<()> {
         user_active: true,
         normal_scale: args.scale.unwrap_or(4),
         mini_scale: 2,
-        mini_anchor: None,
+        edge_peek: None,
         press_start: None,
         keyboard: None,
         surfaces: Vec::new(),
