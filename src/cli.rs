@@ -105,7 +105,12 @@ fn cmd_setup_codex() -> i32 {
         ("args".to_string(), toml::Value::Array(vec!["mcp".into(), "serve".into()])),
     ]));
     toml_set(&mut v, &["mcp_servers", "hyprpet"], entry);
-    match std::fs::write(&path, v.to_string()) {
+    let out = match toml::to_string_pretty(&v) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("序列化失败: {e}"); return 1; }
+    };
+    backup(&path);
+    match std::fs::write(&path, out) {
         Ok(_) => { println!("已注册到 {}", path.display()); 0 }
         Err(e) => { eprintln!("写入 {} 失败: {e}", path.display()); 1 }
     }
@@ -152,10 +157,37 @@ fn cmd_export(target: &str) -> i32 {
             ]));
             toml_set(&mut v, &["mcp_servers", &m.name], entry);
         }
-        let _ = std::fs::write(&path, v.to_string());
+        match toml::to_string_pretty(&v) {
+            Ok(out) => {
+                backup(&path);
+                let _ = std::fs::write(&path, out);
+            }
+            Err(e) => eprintln!("[codex] 序列化失败: {e}"),
+        }
         println!("[codex] 已写入 {}", path.display());
     }
     0
+}
+
+/// 修改配置文件前的强制备份（保留原文件与权限）
+fn backup(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bak = path.with_file_name(format!(
+        "{}.hyprpet-bak-{}",
+        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        ts
+    ));
+    if let Err(e) = std::fs::copy(path, &bak) {
+        eprintln!("警告: 备份 {} 失败: {e}（中止写入）", path.display());
+        std::process::exit(1);
+    }
+    eprintln!("已备份 → {}", bak.display());
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -187,6 +219,7 @@ fn merge_json(path: &std::path::Path, keys: &[&str], entry: &serde_json::Value) 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    backup(path);
     std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
