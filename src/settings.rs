@@ -141,15 +141,18 @@ impl Settings {
             );
             // 显示（api_key 掩码，首尾各留 4 位）
             let raw = &self.fields[i];
-            let display: String = if i == 2 && raw.len() > 12 {
-                format!("{}****{}", &raw[..4], &raw[raw.len() - 4..])
+            let chars: Vec<char> = raw.chars().collect();
+            let display: String = if i == 2 && chars.len() > 12 {
+                let head: String = chars[..4].iter().collect();
+                let tail: String = chars[chars.len() - 4..].iter().collect();
+                format!("{head}****{tail}")
             } else {
                 raw.clone()
             };
             let max_w = w as i32 - PAD * 2 - 12;
             let mut d: &str = &display;
             while font.text_width(d).round() as i32 > max_w && !d.is_empty() {
-                d = &d[1..];
+                d = crate::ui::trim_first(d);
             }
             font.draw_text(buf, buf_w, viewport, x + PAD + 5, iy + 6, d, TEXT);
             if focused && self.cursor_on {

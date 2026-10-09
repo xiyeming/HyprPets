@@ -130,6 +130,15 @@ enum EdgeDir {
     Bottom,
 }
 
+/// 客户端键盘自动重复状态（合成器/fcitx5 不发重复事件时本地驱动）
+struct KeyRepeat {
+    raw_code: u32,
+    keysym: smithay_client_toolkit::seat::keyboard::Keysym,
+    utf8: Option<String>,
+    next_fire: Instant,
+    rate: u32,
+}
+
 /// 收边探头状态机相位
 #[derive(Clone, Copy, PartialEq)]
 enum PeekPhase {
@@ -248,6 +257,10 @@ struct App {
     edge_peek: Option<EdgePeek>,
     /// 当前键盘修饰键（Ctrl+V 粘贴用）
     mods: Modifiers,
+    /// 合成器报告的重复速率/延迟（次/秒, 毫秒）
+    key_repeat: Option<(u32, u32)>,
+    /// 进行中的按键重复
+    key_repeat_state: Option<KeyRepeat>,
     /// 左键按下起点（单击判定）
     press_start: Option<(f64, f64)>,
     /// 本次悬停是否已触发过反应（避免重复）
@@ -1244,6 +1257,8 @@ impl App {
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
 
+        self.tick_key_repeat();
+
         let Some(bbox) = self.layout_bbox() else { return };
         let mut moved = false;
         let mut animated = false;
@@ -1863,6 +1878,14 @@ impl KeyboardHandler for App {
         _serial: u32,
         event: KeyEvent,
     ) {
+        // 同一键未释放又收到 press = 合成器/IM 发来的合成重复：忽略，
+        // 由本地重复计时器统一驱动（避免双重触发）
+        if let Some(r) = &self.key_repeat_state {
+            if r.raw_code == event.raw_code {
+                return;
+            }
+        }
+        self.arm_key_repeat(&event);
         self.on_key_press(&event);
     }
 
@@ -1872,8 +1895,13 @@ impl KeyboardHandler for App {
         _qh: &QueueHandle<Self>,
         _keyboard: &WlKeyboard,
         _serial: u32,
-        _event: KeyEvent,
+        event: KeyEvent,
     ) {
+        if let Some(r) = &self.key_repeat_state {
+            if r.raw_code == event.raw_code {
+                self.key_repeat_state = None;
+            }
+        }
     }
 
     fn update_modifiers(
@@ -1893,8 +1921,13 @@ impl KeyboardHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _keyboard: &WlKeyboard,
-        _info: smithay_client_toolkit::seat::keyboard::RepeatInfo,
+        info: smithay_client_toolkit::seat::keyboard::RepeatInfo,
     ) {
+        use smithay_client_toolkit::seat::keyboard::RepeatInfo;
+        self.key_repeat = match info {
+            RepeatInfo::Repeat { rate, delay } => Some((rate.get(), delay)),
+            RepeatInfo::Disable => None,
+        };
     }
 
     fn update_keymap(
@@ -1908,6 +1941,42 @@ impl KeyboardHandler for App {
 }
 
 impl App {
+    /// 按下键时武装本地重复（Return/Escape 不重复；速率来自合成器 repeat_info）
+    fn arm_key_repeat(&mut self, event: &KeyEvent) {
+        self.key_repeat_state = None;
+        let Some((rate, delay)) = self.key_repeat else { return };
+        if rate == 0 {
+            return;
+        }
+        let code: u32 = event.keysym.into();
+        if matches!(code, KS_RETURN | KS_ESCAPE) {
+            return;
+        }
+        self.key_repeat_state = Some(KeyRepeat {
+            raw_code: event.raw_code,
+            keysym: event.keysym,
+            utf8: event.utf8.clone(),
+            next_fire: Instant::now() + std::time::Duration::from_millis(delay as u64),
+            rate,
+        });
+    }
+
+    /// 重复计时器到点：重放按键动作
+    fn tick_key_repeat(&mut self) {
+        let now = Instant::now();
+        let fire = self
+            .key_repeat_state
+            .as_ref()
+            .filter(|r| now >= r.next_fire)
+            .map(|r| (r.keysym, r.utf8.clone(), r.rate));
+        if let Some((keysym, utf8, rate)) = fire {
+            if let Some(r) = &mut self.key_repeat_state {
+                r.next_fire = now + std::time::Duration::from_millis((1000 / rate.max(1)) as u64);
+            }
+            self.on_key_press(&KeyEvent { time: 0, raw_code: 0, keysym, utf8 });
+        }
+    }
+
     /// 读取系统剪贴板文本
     fn clipboard_text() -> Option<String> {
         let out = std::process::Command::new("wl-paste")
@@ -2548,6 +2617,8 @@ fn main() -> Result<()> {
         edge_peek: None,
         press_start: None,
         mods: Modifiers::default(),
+        key_repeat: None,
+        key_repeat_state: None,
         hover_reacted: false,
         keyboard: None,
         surfaces: Vec::new(),

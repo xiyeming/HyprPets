@@ -77,7 +77,7 @@ impl Chat {
         let text_max = w as i32 - PAD * 2 - 14;
         let mut display: &str = &text;
         while font.text_width(display).round() as i32 > text_max && !display.is_empty() {
-            display = &display[1..];
+            display = ui::trim_first(display);
         }
         let tw = font.text_width(display).round() as i32;
         (x + PAD + 6 + tw, iy, 2, font.px() as i32)
@@ -187,7 +187,7 @@ impl Chat {
         let text_max = inner_w - 14;
         let mut display: &str = &shown;
         while font.text_width(display).round() as i32 > text_max && !display.is_empty() {
-            display = &display[1..];
+            display = ui::trim_first(display);
         }
         let input_len = self.input.chars().count().min(display.chars().count());
         let (disp_input, disp_pre) = display.split_at(display.char_indices().nth(input_len).map(|(i, _)| i).unwrap_or(display.len()));

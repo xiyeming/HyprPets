@@ -113,6 +113,14 @@ impl FontKit {
     }
 }
 
+/// 去掉首字符（按字符边界，多字节安全）
+pub fn trim_first(s: &str) -> &str {
+    match s.char_indices().nth(1) {
+        Some((i, _)) => &s[i..],
+        None => "",
+    }
+}
+
 /// 预乘 src over 混合：cov ∈ 0..=255
 fn blend(buf: &mut [u32], idx: usize, src: u32, cov: u32) {
     let inv = 255 - cov;
