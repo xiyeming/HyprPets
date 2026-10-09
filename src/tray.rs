@@ -109,6 +109,11 @@ impl ksni::Tray for PetTray {
                 ..Default::default()
             }),
             MenuItem::Standard(StandardItem {
+                label: "LLM 设置…".into(),
+                activate: item(MenuCmd::OpenSettings),
+                ..Default::default()
+            }),
+            MenuItem::Standard(StandardItem {
                 label: if self.hidden_edge { "弹出边缘" } else { "收进边缘" }.into(),
                 activate: item(MenuCmd::HideEdge),
                 ..Default::default()

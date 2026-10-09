@@ -74,12 +74,20 @@ model = "gpt-4o-mini"
 [security]
 shell_allow = ["ls", "date", "uptime", "df", "free", "cat /proc"]
 
-# MCP 插件（可选，stdio 进程）
-[[mcp]]
-name = "filesystem"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/docs"]
 ```
+
+**方式三（CLI 快速接入）**：从主流 agent 工具一键导入已配置的 MCP server：
+
+```bash
+hyprpet mcp import all        # 扫描 claude-code / claude-desktop / codex / pi /
+                              # opencode / chatgpt-desktop / gemini / cursor / vscode
+hyprpet mcp import codex      # 或指定单个来源
+hyprpet mcp add myserver npx -y some-mcp-server
+hyprpet mcp list / remove <name>
+```
+
+导入去重、写回 agent.toml，运行中的宠物热加载（MCP 连接自动重建）。
+hyprpet 仅支持 stdio 类型 MCP（远程 http/sse 自动跳过并提示）。
 
 内置工具：`get_system_status`、`set_timer`、`get_clipboard`、`run_command`（白名单），以及所有已配置 MCP server 的工具。
 

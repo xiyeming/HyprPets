@@ -106,6 +106,52 @@ impl AgentConfig {
     }
 }
 
+/// 保存配置（手写 TOML，保留 mcp 段落；api_key 等字符串安全转义）
+pub fn save_config(cfg: &AgentConfig) {
+    fn q(s: &str) -> String {
+        toml::Value::String(s.to_string()).to_string()
+    }
+    let mut out = String::new();
+    if let Some(llm) = &cfg.llm {
+        out += "[llm]\n";
+        out += &format!("backend = {}\n", q(&llm.backend));
+        out += &format!("base_url = {}\n", q(&llm.base_url));
+        if let Some(k) = &llm.api_key {
+            out += &format!("api_key = {}\n", q(k));
+        }
+        out += &format!("model = {}\n", q(&llm.model));
+        if !llm.system_prompt.is_empty() && llm.system_prompt != default_system_prompt() {
+            out += &format!("system_prompt = {}\n", q(&llm.system_prompt));
+        }
+        out += "\n";
+    }
+    out += "[security]\nshell_allow = [";
+    for (i, item) in cfg.security.shell_allow.iter().enumerate() {
+        if i > 0 {
+            out += ", ";
+        }
+        out += &q(item);
+    }
+    out += "]\n";
+    for m in &cfg.mcp {
+        out += "\n[[mcp]]\n";
+        out += &format!("name = {}\n", q(&m.name));
+        out += &format!("command = {}\n", q(&m.command));
+        out += "args = [";
+        for (i, arg) in m.args.iter().enumerate() {
+            if i > 0 {
+                out += ", ";
+            }
+            out += &q(arg);
+        }
+        out += "]\n";
+    }
+    let _ = std::fs::create_dir_all(config_dir());
+    if let Err(e) = std::fs::write(config_dir().join("agent.toml"), out) {
+        eprintln!("[agent] 保存配置失败: {e}");
+    }
+}
+
 pub fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -175,11 +221,35 @@ pub fn spawn_agent(
             }
         }
 
+        let mut mcp_sig = format!("{:?}", config.mcp);
         while let Ok(req) = rx_req.recv() {
             match req {
                 AgentRequest::Chat(text) => {
+                    // 配置热重载（菜单设置 / hyprpet mcp CLI 改动即生效）
+                    let fresh = AgentConfig::load();
+                    let new_sig = format!("{:?}", fresh.mcp);
+                    if new_sig != mcp_sig {
+                        mcp_sig = new_sig;
+                        for (_, r) in &mcp_peers {
+                            r.cancellation_token().cancel();
+                        }
+                        mcp_peers.clear();
+                        mcp_tools.clear();
+                        if let Some(rt) = &rt {
+                            for server in &fresh.mcp {
+                                match init_mcp_server(rt, server) {
+                                    Ok((tools, running)) => {
+                                        eprintln!("[agent] MCP '{}' 已连接（{} 个工具）", server.name, tools.len());
+                                        mcp_tools.extend(tools);
+                                        mcp_peers.push((server.name.clone(), running));
+                                    }
+                                    Err(e) => eprintln!("[agent] MCP '{}' 连接失败: {e:#}", server.name),
+                                }
+                            }
+                        }
+                    }
                     let _ = tx_main.send(AgentEvent::Busy(true));
-                    let reply = handle_chat(&config, http.as_ref(), rt.as_ref(), &mcp_peers, &mcp_tools, &text, &tx_main);
+                    let reply = handle_chat(&fresh, http.as_ref(), rt.as_ref(), &mcp_peers, &mcp_tools, &text, &tx_main);
                     let _ = tx_main.send(AgentEvent::Busy(false));
                     let _ = tx_main.send(AgentEvent::Reply(reply));
                 }

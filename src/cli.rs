@@ -1,0 +1,270 @@
+//! `hyprpet mcp` CLI：MCP server 快速接入与主流 agent 配置导入。
+//!
+//! ```text
+//! hyprpet mcp add <name> <command> [args...]   # 手动添加 stdio MCP server
+//! hyprpet mcp remove <name>                    # 移除
+//! hyprpet mcp list                             # 列出
+//! hyprpet mcp import [all|claude-code|claude-desktop|codex|pi|opencode|chatgpt|gemini|cursor|vscode]
+//! ```
+//!
+//! 导入源（文件存在才导入，格式自动识别）：
+//! - claude-code    ~/.claude.json（+ 当前目录 .mcp.json）的 mcpServers
+//! - claude-desktop ~/.claude/claude_desktop_config.json 的 mcpServers
+//! - codex          ~/.codex/config.toml 的 [mcp_servers.*]
+//! - pi             ~/.pi/agent/mcp.json 的 mcpServers
+//! - opencode       ~/.config/opencode/opencode.json 的 mcp（local 类型）
+//! - chatgpt        ~/.chatgpt/mcp_settings.json 的 mcpServers（ChatGPT 桌面端）
+//! - gemini         ~/.gemini/settings.json 的 mcpServers
+//! - cursor         ~/.cursor/mcp.json 的 mcpServers
+//! - vscode         ./.vscode/mcp.json 的 servers
+
+use std::path::PathBuf;
+
+use crate::agent::{AgentConfig, McpServer};
+
+pub fn mcp_main(args: &[String]) -> i32 {
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        usage();
+        return 2;
+    };
+    match sub {
+        "add" => cmd_add(args.get(1..).unwrap_or(&[])),
+        "remove" | "rm" => cmd_remove(args.get(1..).unwrap_or(&[])),
+        "list" | "ls" => cmd_list(),
+        "import" => cmd_import(args.get(1).map(|s| s.as_str()).unwrap_or("all")),
+        _ => {
+            usage();
+            2
+        }
+    }
+}
+
+fn usage() {
+    eprintln!(
+        "用法:\n  hyprpet mcp add <name> <command> [args...]\n  hyprpet mcp remove <name>\n  hyprpet mcp list\n  hyprpet mcp import [all|claude-code|claude-desktop|codex|pi|opencode|chatgpt|gemini|cursor|vscode]"
+    );
+}
+
+/// 统一的 server 描述（导入中间格式）
+#[derive(Debug, Clone)]
+struct ServerDef {
+    name: String,
+    command: String,
+    args: Vec<String>,
+    source: String,
+}
+
+fn cmd_add(args: &[String]) -> i32 {
+    let (Some(name), Some(command)) = (args.first(), args.get(1)) else {
+        eprintln!("用法: hyprpet mcp add <name> <command> [args...]");
+        return 2;
+    };
+    let rest = args.get(2..).unwrap_or(&[]);
+    let mut cfg = AgentConfig::load();
+    cfg.mcp.retain(|m| m.name != *name);
+    cfg.mcp.push(McpServer {
+        name: name.clone(),
+        command: command.clone(),
+        args: rest.to_vec(),
+    });
+    crate::agent::save_config(&cfg);
+    println!("已添加 [{name}] {command} {}（对话中即可调用）", rest.join(" "));
+    0
+}
+
+fn cmd_remove(args: &[String]) -> i32 {
+    let Some(name) = args.first() else {
+        eprintln!("用法: hyprpet mcp remove <name>");
+        return 2;
+    };
+    let mut cfg = AgentConfig::load();
+    let before = cfg.mcp.len();
+    cfg.mcp.retain(|m| m.name != *name);
+    if cfg.mcp.len() == before {
+        eprintln!("未找到 [{name}]");
+        return 1;
+    }
+    crate::agent::save_config(&cfg);
+    println!("已移除 [{name}]");
+    0
+}
+
+fn cmd_list() -> i32 {
+    let cfg = AgentConfig::load();
+    if cfg.mcp.is_empty() {
+        println!("（未配置 MCP server，用 `hyprpet mcp add` 或 `hyprpet mcp import all` 添加）");
+    }
+    for m in &cfg.mcp {
+        println!("{}: {} {}", m.name, m.command, m.args.join(" "));
+    }
+    0
+}
+
+fn cmd_import(tool: &str) -> i32 {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let mut found: Vec<ServerDef> = Vec::new();
+
+    let mut try_source = |label: &str, defs: Vec<ServerDef>| {
+        if !defs.is_empty() {
+            println!("[{label}] 发现 {} 个:", defs.len());
+            for d in &defs {
+                println!("  {}: {} {}", d.name, d.command, d.args.join(" "));
+            }
+            found.extend(defs);
+        }
+    };
+
+    match tool {
+        "all" => {
+            try_source("claude-code", from_claude(&home.join(".claude.json")));
+            try_source("claude-code(local)", from_claude(&PathBuf::from(".mcp.json")));
+            try_source("claude-desktop", from_claude(&home.join(".claude/claude_desktop_config.json")));
+            try_source("codex", from_codex(&home.join(".codex/config.toml")));
+            try_source("pi", from_claude(&home.join(".pi/agent/mcp.json")));
+            try_source("opencode", from_opencode(&home.join(".config/opencode/opencode.json")));
+            try_source("chatgpt", from_claude(&home.join(".chatgpt/mcp_settings.json")));
+            try_source("gemini", from_claude(&home.join(".gemini/settings.json")));
+            try_source("cursor", from_claude(&home.join(".cursor/mcp.json")));
+            try_source("vscode", from_vscode(&PathBuf::from(".vscode/mcp.json")));
+        }
+        "claude-code" => try_source("claude-code", from_claude(&home.join(".claude.json"))),
+        "claude-desktop" => try_source("claude-desktop", from_claude(&home.join(".claude/claude_desktop_config.json"))),
+        "codex" => try_source("codex", from_codex(&home.join(".codex/config.toml"))),
+        "pi" => try_source("pi", from_claude(&home.join(".pi/agent/mcp.json"))),
+        "opencode" => try_source("opencode", from_opencode(&home.join(".config/opencode/opencode.json"))),
+        "chatgpt" => try_source("chatgpt", from_claude(&home.join(".chatgpt/mcp_settings.json"))),
+        "gemini" => try_source("gemini", from_claude(&home.join(".gemini/settings.json"))),
+        "cursor" => try_source("cursor", from_claude(&home.join(".cursor/mcp.json"))),
+        "vscode" => try_source("vscode", from_vscode(&PathBuf::from(".vscode/mcp.json"))),
+        other => {
+            eprintln!("未知来源: {other}");
+            return 2;
+        }
+    }
+
+    if found.is_empty() {
+        println!("未发现可导入的 MCP server（检查对应 agent 是否已配置 MCP）");
+        return 0;
+    }
+
+    let mut cfg = AgentConfig::load();
+    let mut added = 0;
+    for d in found {
+        if cfg.mcp.iter().any(|m| m.name == d.name) {
+            println!("[{}] 已存在，跳过", d.name);
+            continue;
+        }
+        cfg.mcp.push(McpServer { name: d.name, command: d.command, args: d.args });
+        added += 1;
+    }
+    crate::agent::save_config(&cfg);
+    println!("已导入 {added} 个 MCP server 到 ~/.config/hyprpet/agent.toml（热生效，新对话即可调用）");
+    0
+}
+
+// ---------- 各来源解析 ----------
+
+/// claude 系 JSON：{"mcpServers": {"name": {"command": "...", "args": [...]}}}
+fn from_claude(path: &std::path::Path) -> Vec<ServerDef> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(path).unwrap_or_default(),
+    ) else {
+        return Vec::new();
+    };
+    let Some(map) = v.get("mcpServers").and_then(|m| m.as_object()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(name, cfg)| {
+            let command = cfg.get("command")?.as_str()?.to_string();
+            let args = cfg
+                .get("args")
+                .and_then(|a| a.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Some(ServerDef { name: name.clone(), command, args, source: String::new() })
+        })
+        .collect()
+}
+
+/// codex TOML：[mcp_servers.name] command / args
+fn from_codex(path: &std::path::Path) -> Vec<ServerDef> {
+    #[derive(serde::Deserialize, Default)]
+    struct CodexConfig {
+        mcp_servers: std::collections::HashMap<String, CodexServer>,
+    }
+    #[derive(serde::Deserialize)]
+    struct CodexServer {
+        command: Option<String>,
+        args: Option<Vec<String>>,
+    }
+    let Ok(cfg) = toml::from_str::<CodexConfig>(&std::fs::read_to_string(path).unwrap_or_default())
+    else {
+        return Vec::new();
+    };
+    cfg.mcp_servers
+        .into_iter()
+        .filter_map(|(name, s)| {
+            let command = s.command?;
+            Some(ServerDef { name, command, args: s.args.unwrap_or_default(), source: String::new() })
+        })
+        .collect()
+}
+
+/// opencode JSON：{"mcp": {"name": {"type": "local", "command": ["..."]}}}
+fn from_opencode(path: &std::path::Path) -> Vec<ServerDef> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(path).unwrap_or_default(),
+    ) else {
+        return Vec::new();
+    };
+    let Some(map) = v.get("mcp").and_then(|m| m.as_object()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(name, cfg)| {
+            // 仅支持 local（stdio）类型
+            if cfg.get("type").and_then(|t| t.as_str()) == Some("remote") {
+                eprintln!("  (跳过远程 MCP [{name}]，hyprpet 仅支持 stdio)");
+                return None;
+            }
+            let command = cfg.get("command")?;
+            let (cmd, mut args) = match command {
+                serde_json::Value::String(s) => (s.clone(), Vec::new()),
+                serde_json::Value::Array(arr) => {
+                    let mut it = arr.iter().filter_map(|x| x.as_str().map(String::from));
+                    let cmd = it.next()?;
+                    (cmd, it.collect())
+                }
+                _ => return None,
+            };
+            if let Some(extra) = cfg.get("args").and_then(|a| a.as_array()) {
+                args.extend(extra.iter().filter_map(|x| x.as_str().map(String::from)));
+            }
+            Some(ServerDef { name: name.clone(), command: cmd, args, source: String::new() })
+        })
+        .collect()
+}
+
+/// vscode：{"servers": {"name": {"command": ..., "args": [...]}}}
+fn from_vscode(path: &std::path::Path) -> Vec<ServerDef> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(path).unwrap_or_default(),
+    ) else {
+        return Vec::new();
+    };
+    let Some(map) = v.get("servers").and_then(|m| m.as_object()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(name, cfg)| {
+            let command = cfg.get("command")?.as_str()?.to_string();
+            let args = cfg
+                .get("args")
+                .and_then(|a| a.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Some(ServerDef { name: name.clone(), command, args, source: String::new() })
+        })
+        .collect()
+}

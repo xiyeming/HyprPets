@@ -14,6 +14,7 @@ pub enum MenuCmd {
     TogglePassthrough,
     CycleIdle,
     OpenChat,
+    OpenSettings,
     HideEdge,
     Quit,
 }

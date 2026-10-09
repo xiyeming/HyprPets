@@ -15,6 +15,8 @@ mod audio;
 mod builtin_cat;
 mod builtin_slime;
 mod chat;
+mod cli;
+mod settings;
 mod tray;
 mod fsm;
 mod hypr;
@@ -69,6 +71,7 @@ use crate::hypr::{HyprSockets, WinCache};
 use crate::pet::{Pet, PetMode};
 use crate::physics::Physics;
 use crate::renderer::Renderer;
+use crate::settings::Settings;
 use crate::tray::TrayMsg;
 use crate::ui::{Bubble, FontKit, Menu, MenuCmd, MenuItem as UiMenuItem};
 
@@ -221,6 +224,7 @@ struct App {
     audio: Audio,
     bubble: Option<Bubble>,
     chat: Option<Chat>,
+    settings: Option<Settings>,
     agent_tx: Option<std::sync::mpsc::Sender<AgentRequest>>,
     timers: Vec<(Instant, String)>,
     /// text-input-v3（IME 输入）
@@ -540,12 +544,15 @@ impl App {
             self.needs_redraw = true;
         }
 
-        if self.chat.is_some() {
+        if self.chat.is_some() || self.settings.is_some() {
             self.cursor_acc += dt;
             if self.cursor_acc >= 0.5 {
                 self.cursor_acc = 0.0;
                 if let Some(c) = &mut self.chat {
                     c.toggle_cursor();
+                }
+                if let Some(st) = &mut self.settings {
+                    st.toggle_cursor();
                 }
                 self.needs_redraw = true;
             }
@@ -754,6 +761,11 @@ impl App {
             checked: None,
             cmd: MenuCmd::OpenChat,
         });
+        items.push(UiMenuItem::Action {
+            label: "LLM 设置…".into(),
+            checked: None,
+            cmd: MenuCmd::OpenSettings,
+        });
         items.push(UiMenuItem::Separator);
         items.push(UiMenuItem::Action {
             label: "退出 hyprpet".into(),
@@ -798,6 +810,11 @@ impl App {
             MenuCmd::OpenChat => {
                 if !self.pet.is_mini() {
                     self.open_chat();
+                }
+            }
+            MenuCmd::OpenSettings => {
+                if !self.pet.is_mini() {
+                    self.open_settings();
                 }
             }
             MenuCmd::HideEdge => {
@@ -858,7 +875,8 @@ impl App {
     /// - 拖拽或菜单：所有 surface 全屏（跨屏拖动 / 模态菜单不断流）
     /// - 常态：宠物 bbox 与各 surface 的交集
     fn apply_input_region(&mut self) {
-        let fullscreen = self.drag_offset.is_some() || self.menu.is_some();
+        let fullscreen =
+            self.drag_offset.is_some() || self.menu.is_some() || self.settings.is_some();
         for s in &self.surfaces {
             if self.pet.passthrough {
                 s.wl_surface.set_input_region(None);
@@ -1091,6 +1109,10 @@ impl App {
                 self.open_menu();
                 "ok".into()
             }
+            "settings" => {
+                self.open_settings();
+                "ok".into()
+            }
             "skins" => assets::scan_characters()
                 .iter()
                 .map(|(n, _)| n.clone())
@@ -1123,6 +1145,7 @@ impl App {
         let menu = self.menu.as_ref();
         let bubble = self.bubble.as_ref();
         let chat = self.chat.as_ref();
+        let settings = self.settings.as_ref();
         let font = self.font.as_ref();
         let evade = self.evading();
         let flip_y = self.pet_flip_y();
@@ -1174,6 +1197,9 @@ impl App {
                         if let Some(f) = font {
                             c.draw(f, pixels, buf_w, vp);
                         }
+                    }
+                    if let (Some(st), Some(f)) = (settings, font) {
+                        st.draw(f, pixels, buf_w, vp);
                     }
                     if let Some(m) = menu {
                         m.draw(pixels, buf_w, vp);
@@ -1921,7 +1947,75 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// 设置对话框按键：↑↓/Tab 切换字段，Enter 保存，Esc 取消
+    fn settings_key(&mut self, event: &KeyEvent) {
+        const KS_TAB: u32 = 0xFF09;
+        const KS_UP: u32 = 0xFF52;
+        const KS_DOWN: u32 = 0xFF54;
+        let code: u32 = event.keysym.into();
+        match code {
+            KS_RETURN => {
+                if let Some(st) = self.settings.take() {
+                    st.save();
+                }
+                // 保存后收回键盘焦点
+                if self.chat.is_none() {
+                    for s in &self.surfaces {
+                        s.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+                        s.wl_surface.commit();
+                    }
+                }
+                self.bubble = Some(Bubble {
+                    text: "设置已保存".into(),
+                    until: Instant::now() + std::time::Duration::from_secs(3),
+                });
+                self.region_dirty = true;
+                self.needs_redraw = true;
+            }
+            KS_ESCAPE => self.close_settings(),
+            KS_TAB => {
+                if let Some(st) = &mut self.settings {
+                    if event.utf8.as_deref() == Some("\u{1b}") {
+                        // Shift+Tab
+                    }
+                    st.focus_next();
+                }
+                self.needs_redraw = true;
+            }
+            KS_DOWN => {
+                if let Some(st) = &mut self.settings {
+                    st.focus_next();
+                }
+                self.needs_redraw = true;
+            }
+            KS_UP => {
+                if let Some(st) = &mut self.settings {
+                    st.focus_prev();
+                }
+                self.needs_redraw = true;
+            }
+            KS_BACKSPACE => {
+                if let Some(st) = &mut self.settings {
+                    st.focused_mut().pop();
+                }
+                self.needs_redraw = true;
+            }
+            _ => {
+                if let (Some(st), Some(u)) = (&mut self.settings, &event.utf8) {
+                    if !u.chars().any(|c| c.is_control()) {
+                        st.focused_mut().push_str(u);
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+        }
+    }
+
     fn on_key_press(&mut self, event: &KeyEvent) {
+        if self.settings.is_some() {
+            self.settings_key(event);
+            return;
+        }
         if self.chat.is_none() {
             return;
         }
@@ -1974,15 +2068,54 @@ impl App {
         self.needs_redraw = true;
     }
 
+    fn open_settings(&mut self) {
+        if self.settings.is_some() {
+            return;
+        }
+        self.close_menu();
+        self.close_chat();
+        self.ensure_font();
+        let Some(bbox) = self.layout_bbox() else { return };
+        self.settings = Some(Settings::load(
+            (self.pet.x, self.pet.y),
+            self.pet.width_px(),
+            self.pet.height_px(),
+            bbox,
+        ));
+        for s in &self.surfaces {
+            s.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            s.wl_surface.commit();
+        }
+        self.region_dirty = true;
+        self.needs_redraw = true;
+    }
+
+    fn close_settings(&mut self) {
+        if self.settings.is_none() {
+            return;
+        }
+        self.settings = None;
+        if self.chat.is_none() {
+            for s in &self.surfaces {
+                s.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+                s.wl_surface.commit();
+            }
+        }
+        self.region_dirty = true;
+        self.needs_redraw = true;
+    }
+
     fn close_chat(&mut self) {
         if self.chat.is_none() {
             return;
         }
         self.chat = None;
         self.ti_disable();
-        for s in &self.surfaces {
-            s.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-            s.wl_surface.commit();
+        if self.settings.is_none() {
+            for s in &self.surfaces {
+                s.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+                s.wl_surface.commit();
+            }
         }
         self.region_dirty = true;
         self.needs_redraw = true;
@@ -2256,6 +2389,11 @@ fn parse_args() -> Args {
 }
 
 fn main() -> Result<()> {
+    // hyprpet mcp ... 子命令（CLI 模式，不启动桌面宠物）
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(|s| s.as_str()) == Some("mcp") {
+        std::process::exit(cli::mcp_main(&raw[1..]));
+    }
     let args = parse_args();
 
     // 首次运行写入内置角色与提示音
@@ -2322,6 +2460,7 @@ fn main() -> Result<()> {
         audio: Audio::new(),
         bubble: None,
         chat: None,
+        settings: None,
         agent_tx: None,
         timers: Vec::new(),
         ti_manager,
