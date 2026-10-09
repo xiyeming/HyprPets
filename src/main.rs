@@ -37,7 +37,7 @@ use notify::{RecursiveMode, Watcher};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler};
+use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Modifiers};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
@@ -246,6 +246,8 @@ struct App {
     mini_scale: u32,
     /// 收边探头状态机（Some = 已收边）
     edge_peek: Option<EdgePeek>,
+    /// 当前键盘修饰键（Ctrl+V 粘贴用）
+    mods: Modifiers,
     /// 左键按下起点（单击判定）
     press_start: Option<(f64, f64)>,
     /// 本次悬停是否已触发过反应（避免重复）
@@ -875,8 +877,25 @@ impl App {
     /// - 拖拽或菜单：所有 surface 全屏（跨屏拖动 / 模态菜单不断流）
     /// - 常态：宠物 bbox 与各 surface 的交集
     fn apply_input_region(&mut self) {
-        let fullscreen =
-            self.drag_offset.is_some() || self.menu.is_some() || self.settings.is_some();
+        let fullscreen = self.drag_offset.is_some() || self.menu.is_some();
+        // 弹窗（聊天/设置）开放时 region = 宠物 ∪ 弹窗，点击外面直达其他窗口
+        let mut rects: Vec<(i32, i32, i32, i32)> = Vec::new();
+        if !fullscreen {
+            let (px, py) = self
+                .edge_peek
+                .as_ref()
+                .map(|ep| ep.peek)
+                .unwrap_or((self.pet.x, self.pet.y));
+            rects.push((px, py, self.pet.width_px(), self.pet.height_px()));
+            if let Some(c) = &self.chat {
+                let (x, y, w, h) = c.rect;
+                rects.push((x, y, w as i32, h as i32));
+            }
+            if let Some(st) = &self.settings {
+                let (x, y, w, h) = st.rect;
+                rects.push((x, y, w as i32, h as i32));
+            }
+        }
         for s in &self.surfaces {
             if self.pet.passthrough {
                 s.wl_surface.set_input_region(None);
@@ -885,18 +904,14 @@ impl App {
                 if fullscreen {
                     region.add(0, 0, s.size.0 as i32, s.size.1 as i32);
                 } else {
-                    // 收边隐藏：region 覆盖探头位置（探出时露出的脸可点击）
-                    let (px, py) = self
-                        .edge_peek
-                        .as_ref()
-                        .map(|ep| ep.peek)
-                        .unwrap_or((self.pet.x, self.pet.y));
-                    let x0 = px.max(s.origin.0);
-                    let y0 = py.max(s.origin.1);
-                    let x1 = (px + self.pet.width_px()).min(s.origin.0 + s.size.0 as i32);
-                    let y1 = (py + self.pet.height_px()).min(s.origin.1 + s.size.1 as i32);
-                    if x0 < x1 && y0 < y1 {
-                        region.add(x0 - s.origin.0, y0 - s.origin.1, x1 - x0, y1 - y0);
+                    for &(rx, ry, rw, rh) in &rects {
+                        let x0 = rx.max(s.origin.0);
+                        let y0 = ry.max(s.origin.1);
+                        let x1 = (rx + rw).min(s.origin.0 + s.size.0 as i32);
+                        let y1 = (ry + rh).min(s.origin.1 + s.size.1 as i32);
+                        if x0 < x1 && y0 < y1 {
+                            region.add(x0 - s.origin.0, y0 - s.origin.1, x1 - x0, y1 - y0);
+                        }
                     }
                 }
                 s.wl_surface.set_input_region(Some(&region));
@@ -1831,6 +1846,13 @@ impl KeyboardHandler for App {
         _surface: &WlSurface,
         _serial: u32,
     ) {
+        // 键盘焦点被让走（用户点击了其他窗口）→ 关闭弹窗，释放输入
+        if self.settings.is_some() {
+            self.close_settings();
+        }
+        if self.chat.is_some() {
+            self.close_chat();
+        }
     }
 
     fn press_key(
@@ -1860,9 +1882,10 @@ impl KeyboardHandler for App {
         _qh: &QueueHandle<Self>,
         _keyboard: &WlKeyboard,
         _serial: u32,
-        _modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
+        modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
         _layout: u32,
     ) {
+        self.mods = modifiers;
     }
 
     fn update_repeat_info(
@@ -1885,6 +1908,26 @@ impl KeyboardHandler for App {
 }
 
 impl App {
+    /// 读取系统剪贴板文本
+    fn clipboard_text() -> Option<String> {
+        let out = std::process::Command::new("wl-paste")
+            .arg("--no-newline")
+            .arg("--type")
+            .arg("text")
+            .output()
+            .ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    /// 当前是否按下 Ctrl+V（keysym v/V + ctrl 修饰）
+    fn is_paste(&self, code: u32) -> bool {
+        self.mods.ctrl && (code == 0x76 || code == 0x56) // v / V
+    }
+
     /// text-input-v3 是否已就绪（IME 文本走 commit_string 路径）
     fn ti_active(&self) -> bool {
         self.ti_entered && self.text_input.is_some()
@@ -1953,6 +1996,17 @@ impl App {
         const KS_UP: u32 = 0xFF52;
         const KS_DOWN: u32 = 0xFF54;
         let code: u32 = event.keysym.into();
+        if self.is_paste(code) {
+            if let (Some(st), Some(text)) = (&mut self.settings, Self::clipboard_text()) {
+                // 过滤控制字符，限制长度，追加到聚焦字段
+                let clean: String = text.chars().filter(|c| !c.is_control()).take(256).collect();
+                if !clean.is_empty() {
+                    st.focused_mut().push_str(&clean);
+                    self.needs_redraw = true;
+                }
+            }
+            return;
+        }
         match code {
             KS_RETURN => {
                 if let Some(st) = self.settings.take() {
@@ -2020,6 +2074,17 @@ impl App {
             return;
         }
         let code: u32 = event.keysym.into();
+        if self.is_paste(code) {
+            if let (Some(chat), Some(text)) = (&mut self.chat, Self::clipboard_text()) {
+                let clean: String = text.chars().filter(|c| !c.is_control()).take(500).collect();
+                if !clean.is_empty() {
+                    chat.input.push_str(&clean);
+                    self.ti_update_cursor();
+                    self.needs_redraw = true;
+                }
+            }
+            return;
+        }
         match code {
             KS_RETURN => self.submit_chat(),
             KS_ESCAPE => self.close_chat(),
@@ -2055,9 +2120,9 @@ impl App {
             self.pet.height_px(),
             bbox,
         ));
-        // 独占键盘焦点
+        // OnDemand：点击获得焦点，点其他窗口焦点自然让出（标准弹窗语义）
         for s in &self.surfaces {
-            s.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            s.layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
             s.wl_surface.commit();
         }
         // 焦点已就绪（ti_entered）则直接启用 IME；否则等 enter 事件
@@ -2083,7 +2148,7 @@ impl App {
             bbox,
         ));
         for s in &self.surfaces {
-            s.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            s.layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
             s.wl_surface.commit();
         }
         self.region_dirty = true;
@@ -2482,6 +2547,7 @@ fn main() -> Result<()> {
         mini_scale: 2,
         edge_peek: None,
         press_start: None,
+        mods: Modifiers::default(),
         hover_reacted: false,
         keyboard: None,
         surfaces: Vec::new(),
