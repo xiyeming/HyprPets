@@ -1,10 +1,22 @@
-//! 像素风 IMGUI：系统字体文字渲染（fontdb + fontdue）+ 右键换肤菜单。
+//! 像素风 IMGUI：右键配置菜单 + 系统字体文字渲染。
 //!
+//! 菜单项：换肤 / 动作（可勾选）/ 分隔线。托盘与右键菜单共用 MenuCmd。
 //! 所有颜色均为预乘 ARGB（渲染管道约定）。
 
 use std::path::PathBuf;
 
 use crate::sprite::Sheet;
+
+/// 菜单/托盘共用的配置命令
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCmd {
+    ToggleMini,
+    TogglePassthrough,
+    CycleIdle,
+    OpenChat,
+    HideEdge,
+    Quit,
+}
 
 /// 预乘颜色构造
 pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
@@ -16,6 +28,8 @@ pub const PANEL_BORDER: u32 = rgba(150, 155, 180, 255);
 pub const ROW_HOVER: u32 = rgba(70, 92, 150, 190);
 pub const TEXT: u32 = rgba(238, 238, 248, 255);
 pub const TEXT_DIM: u32 = rgba(160, 165, 185, 255);
+pub const CHECK_ON: u32 = rgba(120, 230, 140, 255);
+pub const CHECK_BOX: u32 = rgba(200, 205, 225, 255);
 
 // ---------- 文字 ----------
 
@@ -25,7 +39,6 @@ pub struct FontKit {
 }
 
 impl FontKit {
-    /// 扫描系统字体，优先中文无衬线
     pub fn load() -> Option<FontKit> {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
@@ -72,13 +85,11 @@ impl FontKit {
         let buf_h = (buf.len() / buf_w) as i32;
         for ch in s.chars() {
             let (metrics, coverage) = self.font.rasterize(ch, self.px);
-            // 空格等零宽字形：只前进画笔
             if metrics.width == 0 {
                 pen_x += metrics.advance_width;
                 continue;
             }
             let gx = pen_x.round() as i32 + metrics.xmin;
-            // fontdue bitmap 首行是字形最上行；ymin 是基线到下缘距离
             let gy_top = y_top + self.px as i32 - metrics.ymin - metrics.height as i32;
             for (j, row) in coverage.chunks(metrics.width).enumerate() {
                 let by = gy_top + j as i32 - viewport.1;
@@ -115,15 +126,25 @@ fn blend(buf: &mut [u32], idx: usize, src: u32, cov: u32) {
 
 // ---------- 菜单 ----------
 
-pub struct MenuEntry {
-    pub name: String,
-    pub dir: PathBuf,
-    pub preview: Sheet,
-    pub preview_idx: usize,
+pub enum MenuItem {
+    /// 换肤项（带预览图）
+    Skin {
+        name: String,
+        dir: PathBuf,
+        preview: Sheet,
+        preview_idx: usize,
+    },
+    /// 配置动作（checked = Some 时渲染勾选框）
+    Action {
+        label: String,
+        checked: Option<bool>,
+        cmd: MenuCmd,
+    },
+    Separator,
 }
 
 pub struct Menu {
-    pub entries: Vec<MenuEntry>,
+    pub items: Vec<MenuItem>,
     pub hover: Option<usize>,
     /// (x, y, w, h) 全局坐标
     pub rect: (i32, i32, u32, u32),
@@ -135,28 +156,44 @@ const PREVIEW_SCALE: u32 = 2;
 const BORDER: i32 = 2;
 
 impl Menu {
-    /// 布局菜单：anchor = 宠物左上角（全局），bbox = 所在布局边界
-    pub fn layout(entries: Vec<MenuEntry>, anchor: (i32, i32), pet_h: i32, bbox: (i32, i32, i32, i32), font: FontKit) -> Menu {
-        let preview_h = entries
-            .first()
-            .map(|e| e.preview.frame_h as i32 * PREVIEW_SCALE as i32)
-            .unwrap_or(0);
-        let text_h = font.px as i32;
-        let item_h = preview_h.max(text_h).max(8) + ITEM_PAD * 2;
-        let width = entries
+    pub fn layout(
+        items: Vec<MenuItem>,
+        anchor: (i32, i32),
+        pet_h: i32,
+        bbox: (i32, i32, i32, i32),
+        font: FontKit,
+    ) -> Menu {
+        let preview_h = items
             .iter()
-            .map(|e| {
-                font.text_width(&e.name).round() as i32
-                    + e.preview.frame_w as i32 * PREVIEW_SCALE as i32
-                    + 16
+            .filter_map(|it| match it {
+                MenuItem::Skin { preview, .. } => {
+                    Some(preview.frame_h as i32 * PREVIEW_SCALE as i32)
+                }
+                _ => None,
+            })
+            .next()
+            .unwrap_or(0);
+        let text_h = font.px() as i32;
+        let item_h = preview_h.max(text_h).max(10) + ITEM_PAD * 2;
+        let width = items
+            .iter()
+            .map(|it| match it {
+                MenuItem::Skin { name, preview, .. } => {
+                    font.text_width(name).round() as i32
+                        + preview.frame_w as i32 * PREVIEW_SCALE as i32
+                        + 16
+                }
+                MenuItem::Action { label, checked, .. } => {
+                    font.text_width(label).round() as i32 + if checked.is_some() { 22 } else { 8 }
+                }
+                MenuItem::Separator => 40,
             })
             .max()
             .unwrap_or(60)
             + ITEM_PAD * 2
             + BORDER * 2;
-        let height = item_h * entries.len().max(1) as i32 + BORDER * 2;
+        let height = item_h * items.len().max(1) as i32 + BORDER * 2;
 
-        // 优先在宠物上方弹出，放不下则下方；水平方向钳制在布局内
         let mut y = anchor.1 - height;
         if y < bbox.1 {
             y = anchor.1 + pet_h;
@@ -164,9 +201,10 @@ impl Menu {
         y = y.clamp(bbox.1, (bbox.3 - height).max(bbox.1));
         let x = anchor.0.clamp(bbox.0, (bbox.2 - width).max(bbox.0));
 
-        Menu { entries, hover: None, rect: (x, y, width as u32, height as u32), font }
+        Menu { items, hover: None, rect: (x, y, width as u32, height as u32), font }
     }
 
+    /// 被点击的条目索引
     pub fn hit(&self, global: (f64, f64)) -> Option<usize> {
         let (x, y, w, h) = self.rect;
         let gx = global.0 as i32;
@@ -174,20 +212,32 @@ impl Menu {
         if gx < x || gx >= x + w as i32 || gy < y || gy >= y + h as i32 {
             return None;
         }
-        let item_h = (h as i32 - BORDER * 2) / self.entries.len().max(1) as i32;
+        let item_h = (h as i32 - BORDER * 2) / self.items.len().max(1) as i32;
         let idx = ((gy - y - BORDER) / item_h) as usize;
-        (idx < self.entries.len()).then_some(idx)
+        (idx < self.items.len()).then_some(idx)
     }
 
     pub fn draw(&self, buf: &mut [u32], buf_w: usize, viewport: (i32, i32)) {
         let (mx, my, mw, mh) = self.rect;
-        // 面板 + 边框
         fill_rect(buf, buf_w, viewport, (mx, my, mw, mh), PANEL);
         stroke_rect(buf, buf_w, viewport, (mx, my, mw, mh), PANEL_BORDER);
 
-        let item_h = (mh as i32 - BORDER * 2) / self.entries.len().max(1) as i32;
-        for (i, entry) in self.entries.iter().enumerate() {
+        let item_h = (mh as i32 - BORDER * 2) / self.items.len().max(1) as i32;
+        for (i, item) in self.items.iter().enumerate() {
             let ry = my + BORDER + item_h * i as i32;
+            match item {
+                MenuItem::Separator => {
+                    fill_rect(
+                        buf,
+                        buf_w,
+                        viewport,
+                        (mx + BORDER + 4, ry + item_h / 2, (mw as i32 - BORDER * 2 - 8) as u32, 1),
+                        PANEL_BORDER,
+                    );
+                    continue;
+                }
+                _ => {}
+            }
             if self.hover == Some(i) {
                 fill_rect(
                     buf,
@@ -197,22 +247,39 @@ impl Menu {
                     ROW_HOVER,
                 );
             }
-            // 预览图
-            let frame = entry.preview.frame(entry.preview_idx);
-            entry.preview.blit_frame(
-                buf,
-                buf_w,
-                viewport,
-                frame,
-                (mx + BORDER + ITEM_PAD, ry + ITEM_PAD),
-                PREVIEW_SCALE,
-                255,
-            );
-            // 名称
-            let text_x = mx + BORDER + ITEM_PAD + entry.preview.frame_w as i32 * PREVIEW_SCALE as i32 + 8;
-            let text_y = ry + (item_h - self.font.px as i32) / 2;
-            self.font
-                .draw_text(buf, buf_w, viewport, text_x, text_y, &entry.name, TEXT);
+            match item {
+                MenuItem::Skin { name, preview, preview_idx, .. } => {
+                    let frame = preview.frame(*preview_idx);
+                    preview.blit_frame(
+                        buf,
+                        buf_w,
+                        viewport,
+                        frame,
+                        (mx + BORDER + ITEM_PAD, ry + ITEM_PAD),
+                        PREVIEW_SCALE,
+                        255,
+                    );
+                    let text_x =
+                        mx + BORDER + ITEM_PAD + preview.frame_w as i32 * PREVIEW_SCALE as i32 + 8;
+                    let text_y = ry + (item_h - self.font.px() as i32) / 2;
+                    self.font.draw_text(buf, buf_w, viewport, text_x, text_y, name, TEXT);
+                }
+                MenuItem::Action { label, checked, .. } => {
+                    let mut text_x = mx + BORDER + ITEM_PAD;
+                    if let Some(on) = checked {
+                        // 勾选框 10x10
+                        let cy = ry + (item_h - 10) / 2;
+                        stroke_rect(buf, buf_w, viewport, (text_x, cy, 10, 10), CHECK_BOX);
+                        if *on {
+                            fill_rect(buf, buf_w, viewport, (text_x + 2, cy + 2, 6, 6), CHECK_ON);
+                        }
+                        text_x += 18;
+                    }
+                    let text_y = ry + (item_h - self.font.px() as i32) / 2;
+                    self.font.draw_text(buf, buf_w, viewport, text_x, text_y, label, TEXT);
+                }
+                MenuItem::Separator => {}
+            }
         }
     }
 }
@@ -251,7 +318,6 @@ pub struct Bubble {
 }
 
 impl Bubble {
-    /// 剩余时间 < 0.5s 时不透明度渐出
     pub fn alpha(&self) -> u8 {
         let remain = self.until.saturating_duration_since(std::time::Instant::now());
         let ms = remain.as_millis() as u64;
@@ -274,7 +340,7 @@ pub fn draw_bubble(
     buf: &mut [u32],
     buf_w: usize,
     viewport: (i32, i32),
-    pet: (i32, i32, i32, i32), // x, y, w, h（全局）
+    pet: (i32, i32, i32, i32),
     monitor: (i32, i32, i32, i32),
 ) {
     let text: String = bubble.text.chars().take(24).collect();
@@ -288,7 +354,6 @@ pub fn draw_bubble(
     let above = py - bh - 10 >= monitor.1;
     let by = if above { py - bh - 10 } else { py + ph + 10 };
 
-    // 面板 + 边框 + 尾巴
     fill_rect(buf, buf_w, viewport, (bx, by, bw as u32, bh as u32), BUBBLE_BG);
     stroke_rect(buf, buf_w, viewport, (bx, by, bw as u32, bh as u32), BUBBLE_BORDER);
     let tail_x = (px + pw / 2).clamp(bx + 6, bx + bw - 10);
@@ -300,13 +365,5 @@ pub fn draw_bubble(
         fill_rect(buf, buf_w, viewport, (tail_x + 1, by - 5, 2, 2), BUBBLE_BG);
     }
 
-    font.draw_text(
-        buf,
-        buf_w,
-        viewport,
-        bx + pad + 1,
-        by + (bh - font.px as i32) / 2,
-        &text,
-        BUBBLE_TEXT,
-    );
+    font.draw_text(buf, buf_w, viewport, bx + pad + 1, by + (bh - font.px as i32) / 2, &text, BUBBLE_TEXT);
 }

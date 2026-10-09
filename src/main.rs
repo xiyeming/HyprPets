@@ -15,6 +15,7 @@ mod audio;
 mod builtin_cat;
 mod builtin_slime;
 mod chat;
+mod tray;
 mod fsm;
 mod hypr;
 mod pet;
@@ -68,7 +69,8 @@ use crate::hypr::{HyprSockets, WinCache};
 use crate::pet::{Pet, PetMode};
 use crate::physics::Physics;
 use crate::renderer::Renderer;
-use crate::ui::{Bubble, FontKit, Menu, MenuEntry};
+use crate::tray::TrayMsg;
+use crate::ui::{Bubble, FontKit, Menu, MenuCmd, MenuItem as UiMenuItem};
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -142,6 +144,8 @@ struct App {
     /// 保持 global 绑定存活
     #[allow(dead_code)]
     layer_shell: LayerShell,
+    /// 系统托盘句柄
+    tray_handle: Option<ksni::blocking::Handle<tray::PetTray>>,
     /// 保持文件监视器存活
     #[allow(dead_code)]
     watcher: Option<notify::RecommendedWatcher>,
@@ -301,6 +305,10 @@ impl App {
                     fsm.set(&prev);
                 }
                 self.fsm = Some(fsm);
+                if let Some(h) = &self.tray_handle {
+                    let icon = tray::tray_icon_from_sheet(&character.sheet, character.preview_frame(), 22);
+                    h.update(|t| t.icon = icon);
+                }
                 self.character = Some(character);
                 if let Some(b) = self.layout_bbox() {
                     self.pet.clamp_to(b.0, b.1, b.2, b.3);
@@ -554,21 +562,62 @@ impl App {
 
     // ---------- 菜单 ----------
 
-    fn open_menu(&mut self) {
-        self.ensure_font();
-        let Some(font) = self.font.take() else {
-            eprintln!("[hyprpet] 无可用系统字体，菜单不可用");
-            return;
-        };
-        let entries: Vec<MenuEntry> = assets::scan_characters()
+    /// 构造菜单条目（换肤 + 配置项，状态实时）
+    fn menu_items(&self) -> Vec<UiMenuItem> {
+        let mut items: Vec<UiMenuItem> = assets::scan_characters()
             .into_iter()
             .filter_map(|(name, dir)| {
                 Character::load(&dir).ok().map(|c| {
                     let preview_idx = c.preview_frame();
-                    MenuEntry { name, preview: c.sheet, preview_idx, dir }
+                    UiMenuItem::Skin { name, dir, preview: c.sheet, preview_idx }
                 })
             })
             .collect();
+        if !items.is_empty() {
+            items.push(UiMenuItem::Separator);
+        }
+        items.push(UiMenuItem::Action {
+            label: format!("漫游阈值：{}s（点击切换）", self.behavior.move_after_idle_seconds),
+            checked: None,
+            cmd: MenuCmd::CycleIdle,
+        });
+        items.push(UiMenuItem::Action {
+            label: "mini 模式".into(),
+            checked: Some(self.pet.is_mini()),
+            cmd: MenuCmd::ToggleMini,
+        });
+        items.push(UiMenuItem::Action {
+            label: "鼠标穿透".into(),
+            checked: Some(self.pet.passthrough),
+            cmd: MenuCmd::TogglePassthrough,
+        });
+        items.push(UiMenuItem::Action {
+            label: if self.mini_hidden() { "弹出边缘" } else { "收进边缘" }.into(),
+            checked: None,
+            cmd: MenuCmd::HideEdge,
+        });
+        items.push(UiMenuItem::Action {
+            label: "打开聊天".into(),
+            checked: None,
+            cmd: MenuCmd::OpenChat,
+        });
+        items.push(UiMenuItem::Separator);
+        items.push(UiMenuItem::Action {
+            label: "退出 hyprpet".into(),
+            checked: None,
+            cmd: MenuCmd::Quit,
+        });
+        items
+    }
+
+    fn open_menu(&mut self) {
+        self.ensure_font();
+        self.close_chat();
+        let Some(font) = self.font.take() else {
+            eprintln!("[hyprpet] 无可用系统字体，菜单不可用");
+            return;
+        };
+        let entries = self.menu_items();
         if entries.is_empty() {
             self.font = Some(font);
             return;
@@ -586,6 +635,60 @@ impl App {
         ));
         self.region_dirty = true;
         self.needs_redraw = true;
+    }
+
+    /// 托盘/菜单共用的命令执行
+    fn execute_cmd(&mut self, cmd: MenuCmd) {
+        match cmd {
+            MenuCmd::ToggleMini => self.toggle_mini(),
+            MenuCmd::TogglePassthrough => self.toggle_passthrough(),
+            MenuCmd::OpenChat => {
+                if !self.pet.is_mini() {
+                    self.open_chat();
+                }
+            }
+            MenuCmd::HideEdge => {
+                if !self.pet.is_mini() {
+                    self.toggle_mini();
+                }
+                if self.mini_hidden() {
+                    self.mini_show();
+                } else {
+                    self.mini_hide();
+                }
+            }
+            MenuCmd::Quit => std::process::exit(0),
+            MenuCmd::CycleIdle => {
+                const STEPS: [u64; 4] = [30, 60, 120, 300];
+                let cur = self.behavior.move_after_idle_seconds;
+                let next = STEPS.iter().find(|&&s| s > cur).copied().unwrap_or(STEPS[0]);
+                self.behavior.move_after_idle_seconds = next;
+                self.recreate_idle_notification();
+                // 持久化到 config.toml（watcher 会热重载，双写无害）
+                let cfg = assets::characters_dir().join("../config.toml");
+                let _ = std::fs::write(
+                    cfg,
+                    format!("[behavior]\nmove_after_idle_seconds = {next}\n"),
+                );
+            }
+        }
+        self.sync_tray();
+    }
+
+    /// 托盘勾选状态同步
+    fn sync_tray(&mut self) {
+        if let Some(h) = &self.tray_handle {
+            let mini = self.pet.is_mini();
+            let passthrough = self.pet.passthrough;
+            let idle = self.behavior.move_after_idle_seconds;
+            let hidden = self.mini_hidden();
+            h.update(|t| {
+                t.mini = mini;
+                t.passthrough = passthrough;
+                t.idle_secs = idle;
+                t.hidden_edge = hidden;
+            });
+        }
     }
 
     fn close_menu(&mut self) {
@@ -1135,6 +1238,50 @@ impl App {
                 }
                 PointerEventKind::Press { button, .. } => {
                     if button == BTN_LEFT {
+                        // 菜单命中：换肤 or 配置命令
+                        if self.menu.is_some() {
+                            let hit = self.menu.as_ref().and_then(|mm| mm.hit(global));
+                            if let Some(idx) = hit {
+                                let pick = self.menu.as_ref().and_then(|mm| mm.items.get(idx)).and_then(|it| match it {
+                                    UiMenuItem::Skin { dir, .. } => Some((dir.clone(), None)),
+                                    UiMenuItem::Action { cmd, .. } => Some((std::path::PathBuf::new(), Some(*cmd))),
+                                    UiMenuItem::Separator => None,
+                                });
+                                match pick {
+                                    Some((dir, None)) => {
+                                        self.close_menu();
+                                        self.switch_character(&dir);
+                                    }
+                                    Some((_, Some(cmd))) => {
+                                        self.execute_cmd(cmd);
+                                        // 就地刷新勾选状态（font 留在 menu 内）
+                                        if let Some(old) = self.menu.take() {
+                                            let bbox = self.layout_bbox();
+                                            let items = self.menu_items();
+                                            if let Some(b) = bbox {
+                                                let hover = old.hover;
+                                                let mut new_menu = Menu::layout(
+                                                    items,
+                                                    (self.pet.x, self.pet.y),
+                                                    self.pet.height_px(),
+                                                    b,
+                                                    old.font,
+                                                );
+                                                new_menu.hover = hover.filter(|h| *h < new_menu.items.len());
+                                                self.menu = Some(new_menu);
+                                            } else {
+                                                self.font = Some(old.font);
+                                            }
+                                        }
+                                    }
+                                    None => {}
+                                }
+                                continue;
+                            }
+                            // 点到菜单外：关闭
+                            self.close_menu();
+                            continue;
+                        }
                         // 双击唤起聊天
                         let now = Instant::now();
                         let dbl = self
@@ -1172,23 +1319,6 @@ impl App {
                             });
                             if inside == Some(false) {
                                 self.close_chat();
-                            }
-                            continue;
-                        }
-                        if self.menu.is_some() {
-                            // 模态菜单：命中切换，未命中关闭
-                            let hit = self.menu.as_ref().and_then(|m| m.hit(global));
-                            if let Some(idx) = hit {
-                                let dir = self
-                                    .menu
-                                    .as_ref()
-                                    .and_then(|m| m.entries.get(idx).map(|e| e.dir.clone()));
-                                self.close_menu();
-                                if let Some(dir) = dir {
-                                    self.switch_character(&dir);
-                                }
-                            } else {
-                                self.close_menu();
                             }
                             continue;
                         }
@@ -1956,6 +2086,7 @@ fn main() -> Result<()> {
         last_sense: Instant::now() - std::time::Duration::from_secs(120),
         sense_acc: 0.0,
         cursor_acc: 0.0,
+        tray_handle: None,
         behavior: BehaviorConfig::load(),
         seat: None,
         idle_notifier,
@@ -2234,6 +2365,28 @@ fn main() -> Result<()> {
             }
         }
         Err(e) => eprintln!("[hyprpet] 控制 socket 绑定失败: {e}"),
+    }
+
+    // 系统托盘（SNI）
+    {
+        let (tray_tx, tray_rx) = channel::channel::<TrayMsg>();
+        let icon = app
+            .character
+            .as_ref()
+            .map(|c| tray::tray_icon_from_sheet(&c.sheet, c.preview_frame(), 22))
+            .unwrap_or(ksni::Icon { width: 22, height: 22, data: vec![0; 22 * 22 * 4] });
+        app.tray_handle = tray::spawn_tray(icon, "HyprPet".into(), tray_tx);
+        event_loop
+            .handle()
+            .insert_source(tray_rx, |ev, _, app| match ev {
+                ChannelEvent::Msg(TrayMsg::Cmd(cmd)) => app.execute_cmd(cmd),
+                ChannelEvent::Msg(TrayMsg::Activate) => {
+                    app.toggle_mini();
+                    app.sync_tray();
+                }
+                ChannelEvent::Closed => {}
+            })
+            .map_err(|e| anyhow::anyhow!("注册托盘事件源失败: {e:?}"))?;
     }
 
     // Agent worker 线程（LLM + 工具 + MCP）

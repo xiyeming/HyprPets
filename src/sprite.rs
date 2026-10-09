@@ -74,6 +74,14 @@ impl Sheet {
         Ok((pixels, w, h))
     }
 
+    /// 指定坐标的像素（越界 None）
+    pub fn pixels_ref_at(&self, x: i32, y: i32) -> Option<&u32> {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return None;
+        }
+        Some(&self.pixels[(y as u32 * self.width + x as u32) as usize])
+    }
+
     /// 调试访问（测试/诊断用）
     pub fn pixels_probe(&self) -> &[u32] {
         &self.pixels

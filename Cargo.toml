@@ -26,6 +26,7 @@ sysinfo = "0.37"
 rmcp = { version = "0.8", features = ["client", "transport-child-process"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "process", "io-util", "sync", "time", "macros"] }
 wayland-protocols = { version = "0.32", features = ["unstable", "staging"] }
+ksni = { version = "0.3", features = ["blocking"] }
 
 [profile.release]
 opt-level = 2
