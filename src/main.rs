@@ -118,6 +118,15 @@ enum ControlEvent {
     Quit,
 }
 
+/// 收边方向
+#[derive(Clone, Copy, PartialEq)]
+enum EdgeDir {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 /// 收边探头状态机相位
 #[derive(Clone, Copy, PartialEq)]
 enum PeekPhase {
@@ -137,6 +146,7 @@ enum PeekPhase {
 
 /// 收边探头状态：藏入边缘后周期性探出半张脸张望
 struct EdgePeek {
+    dir: EdgeDir,
     phase: PeekPhase,
     t: f32,
     /// Tucked / Peek 的目标停留时长
@@ -944,16 +954,17 @@ impl App {
         let min = dl.min(dr).min(dt).min(db);
         let pw = (w as f32 * PEEK_RATIO) as i32;
         let ph = (h as f32 * PEEK_RATIO) as i32;
-        let (tucked, peek) = if min == dl {
-            ((m.0 - w + TAB, self.pet.y), (m.0 - w + pw, self.pet.y))
+        let (dir, tucked, peek) = if min == dl {
+            (EdgeDir::Left, (m.0 - w + TAB, self.pet.y), (m.0 - w + pw, self.pet.y))
         } else if min == dr {
-            ((m.2 - TAB, self.pet.y), (m.2 - pw, self.pet.y))
+            (EdgeDir::Right, (m.2 - TAB, self.pet.y), (m.2 - pw, self.pet.y))
         } else if min == dt {
-            ((self.pet.x, m.1 - h + TAB), (self.pet.x, m.1 - h + ph))
+            (EdgeDir::Top, (self.pet.x, m.1 - h + TAB), (self.pet.x, m.1 - h + ph))
         } else {
-            ((self.pet.x, m.3 - TAB), (self.pet.x, m.3 - ph))
+            (EdgeDir::Bottom, (self.pet.x, m.3 - TAB), (self.pet.x, m.3 - ph))
         };
         self.edge_peek = Some(EdgePeek {
+            dir,
             phase: PeekPhase::HideSlide,
             t: 0.0,
             wait: 0.0,
@@ -986,6 +997,20 @@ impl App {
 
     fn mini_hidden(&self) -> bool {
         self.edge_peek.is_some()
+    }
+
+    /// 顶部收边且在隐藏相位：sprite 垂直翻转，头朝屏内探出
+    fn pet_flip_y(&self) -> bool {
+        match &self.edge_peek {
+            Some(ep) => {
+                ep.dir == EdgeDir::Top
+                    && matches!(
+                        ep.phase,
+                        PeekPhase::Tucked | PeekPhase::OutSlide | PeekPhase::Peek | PeekPhase::InSlide
+                    )
+            }
+            None => false,
+        }
     }
 
     // ---------- 外部控制（agent 联动） ----------
@@ -1098,6 +1123,7 @@ impl App {
         let chat = self.chat.as_ref();
         let font = self.font.as_ref();
         let evade = self.evading();
+        let flip_y = self.pet_flip_y();
         let pet = &self.pet;
         let debug_fill = self.debug_fill;
         let mon_rect = self.monitor_rect_of(pet.x + pet.width_px() / 2);
@@ -1127,7 +1153,9 @@ impl App {
                     };
                     if let Some(sheet) = sheet {
                         let rect = sheet.frame(frame);
-                        sheet.blit_frame(pixels, buf_w, vp, rect, (pet.x, pet.y), pet.scale, alpha);
+                        sheet.blit_frame(
+                            pixels, buf_w, vp, rect, (pet.x, pet.y), pet.scale, alpha, flip_y,
+                        );
                     }
                     if let (Some(b), Some(f), Some(mr)) = (bubble, font, mon_rect) {
                         ui::draw_bubble(

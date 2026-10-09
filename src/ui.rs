@@ -272,6 +272,7 @@ impl Menu {
                         (mx + BORDER + ITEM_PAD, ry + ITEM_PAD),
                         PREVIEW_SCALE,
                         255,
+                        false,
                     );
                     let text_x =
                         mx + BORDER + ITEM_PAD + preview.frame_w as i32 * PREVIEW_SCALE as i32 + 8;

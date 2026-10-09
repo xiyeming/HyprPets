@@ -105,6 +105,7 @@ impl Sheet {
         dst: (i32, i32),
         scale: u32,
         alpha: u8,
+        flip_y: bool,
     ) {
         let scale = scale as i32;
         if scale <= 0 {
@@ -134,8 +135,10 @@ impl Sheet {
         let sy1 = ((vy1 - py) / scale).min(fh);
 
         for sy in sy0..sy1 {
+            // flip_y：垂直翻转（顶部收边探头时头朝屏内）
+            let src_y = if flip_y { fh - 1 - sy } else { sy };
             for sx in sx0..sx1 {
-                let mut c = self.pixels[(frame.y as i32 + sy) as usize * self.width as usize
+                let mut c = self.pixels[(frame.y as i32 + src_y) as usize * self.width as usize
                     + (frame.x as i32 + sx) as usize];
                 let a = (c >> 24) & 0xff;
                 if a == 0 {
