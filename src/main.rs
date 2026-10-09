@@ -297,7 +297,12 @@ impl App {
                 self.pet.w = character.sheet.frame_w;
                 self.pet.h = character.sheet.frame_h;
                 if let Some(scale) = character.meta.scale {
-                    self.pet.scale = scale.max(1);
+                    // mini 模式下不重置当前缩放（只更新正常态记忆值），
+                    // 否则热重载/换肤会把 mini 宠物弹回全尺寸
+                    self.normal_scale = scale.max(1);
+                    if !self.pet.is_mini() {
+                        self.pet.scale = scale.max(1);
+                    }
                 }
                 let mut fsm = Fsm::new(character.actions.clone(), &character.default_action);
                 // 尽量延续切换前的动作名
@@ -311,7 +316,10 @@ impl App {
                 }
                 self.character = Some(character);
                 if let Some(b) = self.layout_bbox() {
-                    self.pet.clamp_to(b.0, b.1, b.2, b.3);
+                    // 收边隐藏中的位置是刻意越界的，钳制会把它弹回屏内
+                    if !self.mini_hidden() {
+                        self.pet.clamp_to(b.0, b.1, b.2, b.3);
+                    }
                 }
                 self.region_dirty = true;
                 self.needs_redraw = true;
@@ -762,10 +770,10 @@ impl App {
         eprintln!("[hyprpet] 模式: {}", if self.pet.is_mini() { "mini" } else { "正常" });
     }
 
-    /// 收进最近的屏幕边缘（只留 6px 把手）
+    /// 收进最近的屏幕边缘（只留 6px 把手）；非 mini 自动先进入 mini
     fn mini_hide(&mut self) {
         if !self.pet.is_mini() {
-            return;
+            self.toggle_mini();
         }
         let cx = self.pet.x + self.pet.width_px() / 2;
         let Some(m) = self.monitor_rect_of(cx) else { return };
