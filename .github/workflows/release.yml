@@ -20,7 +20,7 @@ jobs:
       - name: 安装构建依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libwayland-dev libasound2-dev rpm
+          sudo apt-get install -y pkg-config libwayland-dev libasound2-dev libxkbcommon-dev rpm
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
