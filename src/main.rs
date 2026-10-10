@@ -716,7 +716,7 @@ impl App {
     /// 自动 agent 监视：CPU 活跃 → working；安静 → thinking/清除；退出 → done
     fn update_agent_watch(&mut self) {
         const WATCH_COMMS: [&str; 7] = ["pi", "claude", "codex", "cursor-agent", "gemini", "opencode", "copilot"];
-        const ACTIVE_TICKS: u64 = 15; // 3s 采样窗内 ≥0.15s CPU = 活跃
+        const ACTIVE_TICKS: u64 = 30; // 3s 采样窗内 ≥0.3s CPU = 活跃（node 空闲轮询通常 0.05~0.2s，避开误报）
 
         // 发现受监视进程
         let mut found: Vec<(u32, String)> = Vec::new();
@@ -764,46 +764,49 @@ impl App {
             any_active |= *active;
         }
 
-        // 状态机（不打扰手动 warning/error/confirm/done）
+        // 状态机（不打扰手动状态：非自动的 working/thinking 也不被清）
+        let manageable = self.agent_status_auto || self.agent_status.is_none();
         let manual_hold = matches!(self.agent_status.as_ref().map(|s| s.kind),
             Some(StatusKind::Warning) | Some(StatusKind::Error) | Some(StatusKind::Confirm))
             && !self.agent_status_auto;
-        if manual_hold { return; }
+        if manual_hold || !manageable { return; }
 
         let cur = self.agent_status.as_ref().map(|s| s.kind);
         if any_active {
             self.agent_quiet_since = None;
             if cur != Some(StatusKind::Working) {
-                // 开始干活（或从 thinking 升级）
+                // 开始干活（或从 thinking 升级）；仅在无状态时提示
                 self.set_agent_status_ex("working", "", cur.is_none(), true);
             }
         } else {
-            let quiet_long = self.agent_quiet_since
-                .map(|t| t.elapsed() > std::time::Duration::from_secs(12))
-                .unwrap_or(false);
-            match cur {
-                Some(StatusKind::Working) => {
-                    if self.agent_quiet_since.is_none() {
-                        self.agent_quiet_since = Some(Instant::now());
-                    } else if quiet_long {
-                        // 仍在等模型响应 → thinking；彻底无进程 → 清除
-                        if !self.agent_watch.is_empty() {
-                            self.set_agent_status_ex("thinking", "", false, true);
-                        } else {
-                            self.agent_status = None;
-                            self.agent_status_auto = false;
-                            self.needs_redraw = true;
-                        }
-                        self.agent_quiet_since = None;
-                    }
+            // 不活跃：累积静默时长（状态机每 3s 跑一次，12s = 连续 4 次采样无活跃）
+            let quiet_for = match self.agent_quiet_since {
+                None => {
+                    self.agent_quiet_since = Some(Instant::now());
+                    0.0
                 }
-                Some(StatusKind::Thinking) => {
-                    if self.agent_watch.is_empty() || quiet_long {
+                Some(t) => t.elapsed().as_secs_f32(),
+            };
+            match cur {
+                Some(StatusKind::Working) if quiet_for >= 12.0 => {
+                    if !self.agent_watch.is_empty() {
+                        // 进程仍在（等模型响应）→ thinking，并重置计时进入下一阶段
+                        self.set_agent_status_ex("thinking", "", false, true);
+                        self.agent_quiet_since = Some(Instant::now());
+                    } else {
+                        // 彻底无进程 → 直接清除
                         self.agent_status = None;
                         self.agent_status_auto = false;
-                        self.needs_redraw = true;
                         self.agent_quiet_since = None;
+                        self.needs_redraw = true;
                     }
+                }
+                Some(StatusKind::Thinking) if quiet_for >= 12.0 => {
+                    // thinking 再静默 12s（合计 24s 无活动）→ 状态点撤掉
+                    self.agent_status = None;
+                    self.agent_status_auto = false;
+                    self.agent_quiet_since = None;
+                    self.needs_redraw = true;
                 }
                 _ => {}
             }
