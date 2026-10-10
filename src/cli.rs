@@ -477,3 +477,233 @@ fn from_vscode(path: &std::path::Path) -> Vec<ServerDef> {
         })
         .collect()
 }
+
+// ===================== hyprpet char：快捷添加宠物 =====================
+
+/// `hyprpet char add <名字> <图片.png> [--frame 宽x高] [--force]`
+/// 任意 PNG 一键生成角色目录：拷贝贴图 + meta.toml + 配套 actions.toml。
+/// 单帧图片 → 所有动作用同一帧；--frame 指定帧尺寸 → 按行智能分配动作。
+pub fn char_main(args: &[String]) -> i32 {
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        eprintln!("用法:\n  hyprpet char add <名字> <图片.png> [--frame 宽x高] [--force]\n  hyprpet char list\n  hyprpet char remove <名字>");
+        return 2;
+    };
+    match sub {
+        "add" => char_add(args.get(1..).unwrap_or(&[])),
+        "list" | "ls" => char_list(),
+        "remove" | "rm" => char_remove(args.get(1).map(|s| s.as_str()).unwrap_or("")),
+        _ => {
+            eprintln!("未知子命令 {sub}（add/list/remove）");
+            2
+        }
+    }
+}
+
+fn char_add(args: &[String]) -> i32 {
+    let name = args.first().cloned().unwrap_or_default();
+    let image = args.get(1).cloned().unwrap_or_default();
+    if name.is_empty() || image.is_empty() {
+        eprintln!("用法: hyprpet char add <名字> <图片.png> [--frame 宽x高] [--force]");
+        return 2;
+    }
+    if name.contains(['/', '\\']) || name.contains("..") {
+        eprintln!("名字不能含路径分隔符");
+        return 2;
+    }
+    let mut frame: Option<(u32, u32)> = None;
+    let mut force = false;
+    let mut it = args.get(2..).unwrap_or(&[]).iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--frame" => {
+                let v = it.next().map(|s| s.as_str()).unwrap_or("");
+                let mut p = v.split(['x', 'X', '*']);
+                if let (Some(Ok(w)), Some(Ok(h))) = (p.next().map(str::parse::<u32>), p.next().map(str::parse::<u32>)) {
+                    frame = Some((w, h));
+                } else {
+                    eprintln!("--frame 格式: 宽x高，如 32x32");
+                    return 2;
+                }
+            }
+            "--force" => force = true,
+            other => eprintln!("忽略未知参数: {other}"),
+        }
+    }
+
+    let img_path = std::path::PathBuf::from(&image);
+    if !img_path.is_file() {
+        eprintln!("图片不存在: {image}");
+        return 1;
+    }
+    let (w, h) = match image::image_dimensions(&img_path) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("读取图片失败: {e}"); return 1; }
+    };
+
+    // 帧尺寸：未指定 → 整张图为单帧；指定 → 校验整除
+    let (fw, fh) = frame.unwrap_or((w, h));
+    if fw == 0 || fh == 0 || w % fw != 0 || h % fh != 0 {
+        eprintln!("帧尺寸 {fw}x{fh} 不能整除图片 {w}x{h}");
+        return 2;
+    }
+    let cols = w / fw;
+    let rows = h / fh;
+
+    let dir = crate::assets::characters_dir().join(&name);
+    if dir.exists() && !force {
+        eprintln!("角色 [{name}] 已存在（用 --force 覆盖）");
+        return 1;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("创建目录失败: {e}");
+        return 1;
+    }
+    if let Err(e) = std::fs::copy(&img_path, dir.join("sprites.png")) {
+        eprintln!("拷贝贴图失败: {e}");
+        return 1;
+    }
+
+    let meta = format!(
+        "name = \"{name}\"\nauthor = \"hyprpet char add\"\nscale = 4\nframe_width = {fw}\nframe_height = {fh}\npreview = [0, 0]\n"
+    );
+    if let Err(e) = std::fs::write(dir.join("meta.toml"), meta) {
+        eprintln!("写 meta.toml 失败: {e}");
+        return 1;
+    }
+    if let Err(e) = std::fs::write(dir.join("actions.toml"), gen_actions(cols, rows)) {
+        eprintln!("写 actions.toml 失败: {e}");
+        return 1;
+    }
+    println!("✅ 宠物 [{name}] 已创建: {}", dir.display());
+    println!("   {w}x{h}，帧 {fw}x{fh}（{cols} 列 × {rows} 行）");
+    println!("   右键菜单已可换肤（热重载即时生效）");
+    if rows < 2 {
+        println!("   提示：单行动画表，动作均为 [0,0] 占位，按需编辑 actions.toml");
+    }
+    0
+}
+
+/// 按网格形状生成默认动作表
+fn gen_actions(cols: u32, rows: u32) -> String {
+    let join = |v: Vec<String>| v.join(", ");
+    let row0 = join((0..cols.min(4)).map(|c| format!("[{c}, 0]")).collect());
+    let r1 = if rows > 1 { 1 } else { 0 };
+    let r2 = if rows > 2 { 2 } else { r1 };
+    let last = rows - 1;
+    let walk = join((0..cols.min(4)).map(|c| format!("[{c}, {r1}]")).collect());
+    let walk_r = join((0..cols.min(4)).map(|c| format!("[{c}, {r2}]")).collect());
+    let sleep = join((0..cols.min(3)).map(|c| format!("[{c}, {last}]")).collect());
+    format!(
+        r#"default = "idle"
+
+[actions.idle]
+fps = 2
+loop = true
+duration = 6
+frames = [{row0}]
+next_random = ["walk_left", "walk_right", "sleep"]
+
+[actions.walk_left]
+fps = 8
+loop = true
+duration = 4
+movement = [-70, 0]
+auto_turn = true
+frames = [{walk}]
+next_random = ["idle", "idle", "sleep"]
+
+[actions.walk_right]
+fps = 8
+loop = true
+duration = 4
+movement = [70, 0]
+auto_turn = true
+frames = [{walk_r}]
+next_random = ["idle", "idle", "sleep"]
+
+[actions.sleep]
+fps = 1.5
+loop = true
+duration = 8
+frames = [{sleep}]
+next = "idle"
+
+# 以下动作统一占位 [0,0]，可改为任意帧
+[actions.grabbed]
+fps = 1
+loop = true
+frames = [[0, 0]]
+
+[actions.fall]
+fps = 1
+loop = true
+frames = [[0, 0]]
+
+[actions.land]
+fps = 8
+loop = false
+frames = [[0, 0]]
+next = "idle"
+
+[actions.alert]
+fps = 6
+loop = false
+frames = [[0, 0], [0, 0]]
+next = "idle"
+
+[actions.tired]
+fps = 2
+loop = true
+duration = 4
+frames = [[0, 0]]
+next = "idle"
+
+[actions.celebrate]
+fps = 6
+loop = false
+frames = [[0, 0], [0, 0]]
+next = "idle"
+
+[actions.study]
+fps = 4
+loop = true
+duration = 12
+frames = [[0, 0], [0, 0]]
+next = "idle"
+
+[actions.petted]
+fps = 3
+loop = false
+frames = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]
+next = "idle"
+"#
+    )
+}
+
+fn char_list() -> i32 {
+    let list = crate::assets::scan_characters();
+    if list.is_empty() {
+        println!("（暂无角色）");
+    }
+    for (name, _) in list {
+        println!("{name}");
+    }
+    0
+}
+
+fn char_remove(name: &str) -> i32 {
+    if name.is_empty() {
+        eprintln!("用法: hyprpet char remove <名字>");
+        return 2;
+    }
+    let dir = crate::assets::characters_dir().join(name);
+    if !dir.is_dir() {
+        eprintln!("角色 [{name}] 不存在");
+        return 1;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(_) => { println!("已删除 [{name}]"); 0 }
+        Err(e) => { eprintln!("删除失败: {e}"); 1 }
+    }
+}

@@ -2767,8 +2767,10 @@ fn parse_args() -> Args {
 fn main() -> Result<()> {
     // hyprpet mcp ... 子命令（CLI 模式，不启动桌面宠物）
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.first().map(|s| s.as_str()) == Some("mcp") {
-        std::process::exit(cli::mcp_main(&raw[1..]));
+    match raw.first().map(|s| s.as_str()) {
+        Some("mcp") => std::process::exit(cli::mcp_main(&raw[1..])),
+        Some("char") | Some("character") | Some("pet") => std::process::exit(cli::char_main(&raw[1..])),
+        _ => {}
     }
     let args = parse_args();
 

@@ -86,6 +86,18 @@ exec-once = ~/Projects/ToolsProjects/HyprPets/target/release/hyprpet
 
 右键菜单「换肤」即时切换。内置**像素小猫**和**像素史莱姆**（程序生成 32 帧动画）。
 
+**快捷添加**：任意 PNG 一键变宠物——
+
+```bash
+hyprpet char add 小狐狸 ~/Pictures/fox.png                 # 单帧图片 → 整图即一帧
+hyprpet char add 小狐狸 ~/fox_sheet.png --frame 32x32      # 动画表 → 按行自动分配动作
+hyprpet char list / remove <名字>                           # 管理
+```
+
+自动完成：拷贝贴图 → 写 meta.toml（scale 4）→ 生成配套 actions.toml
+（idle 用第 1 行、walk 用第 2/3 行、sleep 用末行，其余动作占位 [0,0]）。
+创建即热重载，右键菜单立即可选；之后按需要编辑 actions.toml 调整。
+
 自定义角色 = 往目录丢三个文件，**保存即热生效**（无需重启）：
 
 ```text
