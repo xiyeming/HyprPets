@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libwayland-dev libasound2-dev rpm
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 解析版本号
+        id: ver
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          if [ "$VER" = "$GITHUB_REF_NAME" ]; then
+            VER="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "版本: $VER"
+
+      - name: 构建
+        run: cargo build --release
+
+      - name: 整理安装文件
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p stage/usr/bin \
+                   stage/usr/share/doc/hyprpet \
+                   stage/usr/share/applications \
+                   stage/usr/share/icons/hicolor/256x256/apps
+          install -m755 target/release/hyprpet stage/usr/bin/hyprpet
+          install -m644 README.md stage/usr/share/doc/hyprpet/
+          [ -f LICENSE ] && install -m644 LICENSE stage/usr/share/doc/hyprpet/ || true
+          install -m644 assets/icon.png stage/usr/share/icons/hicolor/256x256/apps/hyprpet.png
+          cat > stage/usr/share/applications/hyprpet.desktop <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=hyprpet
+          Comment=Pixel desktop pet for Hyprland
+          Exec=hyprpet
+          Icon=hyprpet
+          Categories=Utility;Amusement;
+          Terminal=false
+          DESKTOP
+
+      # ---------- DEB ----------
+      - name: 打包 DEB
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p debpkg/DEBIAN
+          cat > debpkg/DEBIAN/control <<CONTROL
+          Package: hyprpet
+          Version: $VER
+          Architecture: amd64
+          Maintainer: xiyeming <xiyeming@users.noreply.github.com>
+          Depends: libwayland-client0, libasound2
+          Section: utils
+          Priority: optional
+          Description: Pixel desktop pet for Hyprland
+           A pixel-art desktop pet living on your Hyprland desktop.
+           Autonomous roaming, window-walking, toss physics, notification
+           bubbles, AI/MCP agent integration.
+          CONTROL
+          cp -r stage/usr/. debpkg/usr/
+          dpkg-deb --build --root-owner-group debpkg "hyprpet_${VER}_amd64.deb"
+
+      # ---------- RPM ----------
+      - name: 打包 RPM
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp stage/usr/bin/hyprpet rpmbuild/SOURCES/
+          cp stage/usr/share/applications/hyprpet.desktop rpmbuild/SOURCES/
+          cat > rpmbuild/SPECS/hyprpet.spec <<SPEC
+          Name:           hyprpet
+          Version:        $VER
+          Release:        1%{?dist}
+          Summary:        Pixel desktop pet for Hyprland
+          License:        MIT
+          BuildArch:      x86_64
+          Source0:        hyprpet
+          Source1:        hyprpet.desktop
+          %description
+          A pixel-art desktop pet for the Hyprland Wayland compositor.
+          %install
+          mkdir -p %{buildroot}%{_bindir} %{buildroot}%{_datadir}/applications
+          install -m755 %{SOURCE0} %{buildroot}%{_bindir}/hyprpet
+          install -m644 %{SOURCE1} %{buildroot}%{_datadir}/applications/hyprpet.desktop
+          %files
+          %{_bindir}/hyprpet
+          %{_datadir}/applications/hyprpet.desktop
+          SPEC
+          rpmbuild -bb --define "_topdir $PWD/rpmbuild" rpmbuild/SPECS/hyprpet.spec
+          cp rpmbuild/RPMS/x86_64/hyprpet-${VER}-1.*.x86_64.rpm "./hyprpet-${VER}-1.x86_64.rpm"
+
+      # ---------- PACMAN ----------
+      - name: 打包 pacman
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          PKG="pacmanroot"
+          mkdir -p "$PKG"
+          cp -r stage/usr "$PKG/"
+          cat > "$PKG/.PKGINFO" <<PKGINFO
+          pkgname = hyprpet
+          pkgver = ${VER}-1
+          pkgdesc = Pixel desktop pet for Hyprland
+          url = https://github.com/${GITHUB_REPOSITORY}
+          arch = x86_64
+          license = MIT
+          depends = wayland, alsa-lib
+          PKGINFO
+          (
+            cd "$PKG"
+            find . -type f ! -name .MTREE -print0 | sort -z | while IFS= read -r -d '' f; do
+              printf '%s time=%s size=%s sha256digest=%s\n' \
+                "$f" "$(stat -c %Y "$f")" "$(stat -c %s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done | gzip -n -9 > .MTREE
+          )
+          tar --zstd -cf "hyprpet-${VER}-1-x86_64.pkg.tar.zst" -C "$PKG" .PKGINFO .MTREE usr
+
+      # ---------- AppImage ----------
+      - name: 打包 AppImage
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p AppDir/usr/bin \
+                   AppDir/usr/share/applications \
+                   AppDir/usr/share/icons/hicolor/256x256/apps
+          cp stage/usr/bin/hyprpet AppDir/usr/bin/
+          cp stage/usr/share/applications/hyprpet.desktop AppDir/usr/share/applications/
+          cp stage/usr/share/icons/hicolor/256x256/apps/hyprpet.png AppDir/usr/share/icons/hicolor/256x256/apps/
+          cp stage/usr/share/icons/hicolor/256x256/apps/hyprpet.png AppDir/hyprpet.png
+          ln -sf hyprpet.png AppDir/.DirIcon
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ARCH=x86_64 VERSION="$VER" ./linuxdeploy-x86_64.AppImage \
+            --appimage-extract-and-run --appdir AppDir --output appimage
+          mv hyprpet-*.AppImage "hyprpet-${VER}-x86_64.AppImage"
+
+      # ---------- 校验与发布 ----------
+      - name: 生成校验和
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          sha256sum "hyprpet_${VER}_amd64.deb" \
+                    "hyprpet-${VER}-1.x86_64.rpm" \
+                    "hyprpet-${VER}-1-x86_64.pkg.tar.zst" \
+                    "hyprpet-${VER}-x86_64.AppImage" \
+                    > checksums.txt
+          cat checksums.txt
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          TAG="v${VER}"
+          FILES="hyprpet_${VER}_amd64.deb hyprpet-${VER}-1.x86_64.rpm hyprpet-${VER}-1-x86_64.pkg.tar.zst hyprpet-${VER}-x86_64.AppImage checksums.txt"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" $FILES --clobber
+          else
+            gh release create "$TAG" $FILES --title "hyprpet $TAG" --generate-notes
+          fi
