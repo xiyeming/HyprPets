@@ -74,7 +74,7 @@ exec-once = ~/Projects/ToolsProjects/HyprPets/target/release/hyprpet
 | 左键**双击**（或 `kill -USR2`） | 打开 AI 聊天对话框 |
 | 右键 | 配置菜单（换肤 / 阈值 / mini / 穿透 / 退出） |
 | `kill -USR1` | 切换鼠标穿透（宠物变暗提示） |
-| `kill -USR3` | 切换 mini 模式 |
+| `kill -PWR`（SIGPWR=30） | 切换 mini 模式 |
 | mini 下单击 | 收进最近屏幕边缘（6px 把手） |
 | mini 下双击 / 点把手 | 弹出 / 探头偷看循环 |
 
@@ -244,7 +244,7 @@ echo "state done 成功"       | socat - UNIX-CONNECT:$SOCK   # 状态联动
 layerrule = noanim, hyprpet
 bind = SUPER CTRL, P, exec, killall -s USR1 hyprpet   # 穿透
 bind = SUPER CTRL, C, exec, killall -s USR2 hyprpet   # 聊天
-bind = SUPER CTRL, M, exec, killall -s USR3 hyprpet   # mini
+bind = SUPER CTRL, M, exec, killall -s PWR hyprpet    # mini（SIGPWR=30）
 ```
 
 通知守护进程（quickshell/swaync 等不广播 Notify 信号）通过 DBus BecomeMonitor 模式监听，无需改动通知配置。

@@ -260,7 +260,6 @@ struct ServerDef {
     name: String,
     command: String,
     args: Vec<String>,
-    source: String,
 }
 
 fn cmd_add(args: &[String]) -> i32 {
@@ -391,7 +390,7 @@ fn from_claude(path: &std::path::Path) -> Vec<ServerDef> {
                 .and_then(|a| a.as_array())
                 .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            Some(ServerDef { name: name.clone(), command, args, source: String::new() })
+            Some(ServerDef { name: name.clone(), command, args })
         })
         .collect()
 }
@@ -415,7 +414,7 @@ fn from_codex(path: &std::path::Path) -> Vec<ServerDef> {
         .into_iter()
         .filter_map(|(name, s)| {
             let command = s.command?;
-            Some(ServerDef { name, command, args: s.args.unwrap_or_default(), source: String::new() })
+            Some(ServerDef { name, command, args: s.args.unwrap_or_default() })
         })
         .collect()
 }
@@ -450,7 +449,7 @@ fn from_opencode(path: &std::path::Path) -> Vec<ServerDef> {
             if let Some(extra) = cfg.get("args").and_then(|a| a.as_array()) {
                 args.extend(extra.iter().filter_map(|x| x.as_str().map(String::from)));
             }
-            Some(ServerDef { name: name.clone(), command: cmd, args, source: String::new() })
+            Some(ServerDef { name: name.clone(), command: cmd, args })
         })
         .collect()
 }
@@ -473,7 +472,7 @@ fn from_vscode(path: &std::path::Path) -> Vec<ServerDef> {
                 .and_then(|a| a.as_array())
                 .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            Some(ServerDef { name: name.clone(), command, args, source: String::new() })
+            Some(ServerDef { name: name.clone(), command, args })
         })
         .collect()
 }

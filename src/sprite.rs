@@ -83,6 +83,7 @@ impl Sheet {
     }
 
     /// 调试访问（测试/诊断用）
+    #[cfg(test)]
     pub fn pixels_probe(&self) -> &[u32] {
         &self.pixels
     }

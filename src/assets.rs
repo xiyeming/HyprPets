@@ -25,6 +25,8 @@ pub struct Meta {
     /// 内置资源版本（用于升级已生成的内置角色）
     pub version: Option<u32>,
     pub name: Option<String>,
+    /// 作者（保留：待角色详情 UI 消费）
+    #[allow(dead_code)]
     pub author: Option<String>,
     pub scale: Option<u32>,
     pub frame_width: Option<u32>,
@@ -167,13 +169,6 @@ pub struct Character {
 }
 
 impl Character {
-    pub fn name(&self) -> String {
-        self.meta
-            .name
-            .clone()
-            .unwrap_or_else(|| self.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
-    }
-
     pub fn load(dir: &Path) -> Result<Character> {
         let meta: Meta = if dir.join("meta.toml").exists() {
             toml::from_str(&fs::read_to_string(dir.join("meta.toml"))?)

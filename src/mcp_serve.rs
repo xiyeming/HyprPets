@@ -160,7 +160,7 @@ pub fn serve() -> i32 {
     rt.block_on(async {
         match PetMcp::new().serve(rmcp::transport::stdio()).await {
             Ok(service) => {
-                service.waiting().await;
+                let _ = service.waiting().await;
                 0
             }
             Err(e) => {

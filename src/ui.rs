@@ -345,18 +345,6 @@ pub struct Bubble {
     pub until: std::time::Instant,
 }
 
-impl Bubble {
-    pub fn alpha(&self) -> u8 {
-        let remain = self.until.saturating_duration_since(std::time::Instant::now());
-        let ms = remain.as_millis() as u64;
-        if ms > 500 {
-            255
-        } else {
-            (ms * 255 / 500) as u8
-        }
-    }
-}
-
 const BUBBLE_BG: u32 = rgba(250, 252, 255, 242);
 const BUBBLE_BORDER: u32 = rgba(90, 95, 120, 255);
 const BUBBLE_TEXT: u32 = rgba(35, 38, 52, 255);

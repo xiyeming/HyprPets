@@ -9,7 +9,6 @@
 //! └── .socket.sock    # 命令（写 "j/clients" 等，读到 EOF 为响应）
 //! ```
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;

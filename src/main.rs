@@ -145,6 +145,8 @@ enum StatusKind {
 
 struct AgentStatus {
     kind: StatusKind,
+    /// 状态文本（保留：待状态点悬停提示/托盘 tooltip 消费）
+    #[allow(dead_code)]
     text: String,
     since: Instant,
 }
@@ -355,10 +357,6 @@ impl App {
         bbox
     }
 
-    fn ground_y(&self, bbox: (i32, i32, i32, i32)) -> i32 {
-        bbox.3 - self.pet.height_px()
-    }
-
     fn create_surface_for(&mut self, output: &WlOutput) {
         if self.surfaces.iter().any(|s| s.output == *output) {
             return;
@@ -552,8 +550,8 @@ impl App {
         if let Some(&f) = floors.iter().find(|&&f| (f - y).abs() <= 4) {
             return FloorStatus::OnFloor(f);
         }
-        if let Some(&f) = floors.iter().find(|&&f| f > y + 4) {
-            return FloorStatus::Gap(f);
+        if floors.iter().any(|&f| f > y + 4) {
+            return FloorStatus::Gap;
         }
         FloorStatus::Wall
     }
@@ -1576,7 +1574,7 @@ impl App {
                             moved = true;
                         }
                     }
-                    FloorStatus::Gap(_) => {
+                    FloorStatus::Gap => {
                         // 走出地板边缘 → 坠落
                         self.physics.toss(0.0, 0.0);
                         self.set_action("fall");
@@ -1618,7 +1616,7 @@ impl App {
                         // 地板状态：走出边缘 → 坠落；撞窗口侧壁 → 转向
                         match self.floor_status(self.pet.x, self.pet.x + self.pet.width_px(), self.pet.y) {
                             FloorStatus::OnFloor(_) => {}
-                            FloorStatus::Gap(_) => {
+                            FloorStatus::Gap => {
                                 self.physics.toss(mx * 0.4, 0.0);
                                 self.set_action("fall");
                             }
@@ -1937,8 +1935,8 @@ impl App {
 enum FloorStatus {
     /// 站立在地板 f 上
     OnFloor(i32),
-    /// 下方最近地板 f（走出边缘）
-    Gap(i32),
+    /// 下方有地板可坠落（走出边缘）
+    Gap,
     /// 地板全在上方（窗口侧壁）
     Wall,
 }
@@ -3016,15 +3014,15 @@ fn main() -> Result<()> {
     std::thread::spawn({
         let tx = tx.clone();
         move || {
+            // Linux: SIGUSR1=10 SIGUSR2=12 SIGPWR=30（无 SIGUSR3，用 SIGPWR 切 mini）
             use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
             let mut signals =
-                signal_hook::iterator::Signals::new([SIGUSR1, SIGUSR2, 10, SIGTERM, SIGINT]).expect("注册信号失败");
+                signal_hook::iterator::Signals::new([SIGUSR1, SIGUSR2, 30, SIGTERM, SIGINT]).expect("注册信号失败");
             for sig in signals.forever() {
-                // SIGUSR3 无 signal-hook 常量，值为 10
                 let ev = match sig {
                     SIGUSR1 => ControlEvent::TogglePassthrough,
                     SIGUSR2 => ControlEvent::OpenChat,
-                    10 => ControlEvent::ToggleMini,
+                    30 => ControlEvent::ToggleMini, // SIGPWR=30（signal-hook 无常量）
                     _ => ControlEvent::Quit,
                 };
                 if tx.send(ev).is_err() {

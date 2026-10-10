@@ -166,10 +166,10 @@ impl Chat {
 
         // busy 指示
         if self.busy && self.history.last().map(|h| h.0) != Some(Who::Pet) {
-            let dots = ["…", "… …", "… … …"][(std::time::SystemTime::now()
+            let dots = ["…", "… …", "… … …"][std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| (d.as_millis() / 400 % 3) as usize)
-                .unwrap_or(0))];
+                .unwrap_or(0)];
             font.draw_text(buf, buf_w, viewport, x + PAD, pen_y - line_h - 2, dots, TEXT);
         }
 
