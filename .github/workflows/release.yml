@@ -108,7 +108,7 @@ jobs:
           %{_datadir}/applications/hyprpet.desktop
           SPEC
           rpmbuild -bb --define "_topdir $PWD/rpmbuild" rpmbuild/SPECS/hyprpet.spec
-          cp rpmbuild/RPMS/x86_64/hyprpet-${VER}-1.*.x86_64.rpm "./hyprpet-${VER}-1.x86_64.rpm"
+          mv rpmbuild/RPMS/x86_64/hyprpet-*.x86_64.rpm "./hyprpet-${VER}-1.x86_64.rpm"
 
       # ---------- PACMAN ----------
       - name: 打包 pacman
