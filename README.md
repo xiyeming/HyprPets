@@ -218,8 +218,14 @@ echo "state done 构建成功！"  | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hyprp
 
 典型工作流：任务开始 `status working` → 完成 `status done`（蹦跳庆祝）→ 异常 `status error` → 等你确认 `status confirm`。
 
-**自动联动（零配置）**：宠物每 3s 监视 pi/claude/codex/cursor-agent/gemini/opencode/copilot
-进程树的 CPU——活跃即 `working`（蓝点+陪读），静止 12s 转 `thinking`（黄点，等模型响应），
+**Hooks 精确联动（推荐）**：hyprpet hook install all 一键安装到主流 agent。
+pi 用扩展（~/.pi/agent/extensions/hyprpet.mjs：before_agent_start→working、
+turn_end→done）；claude-code 用 settings.json 六事件 hooks（SessionStart→idle、
+UserPromptSubmit→thinking、Pre/PostToolUse→working、Stop→done、Notification→confirm）；
+codex 用 config.toml notify（agent-turn-complete→done）。
+hyprpet hook list / uninstall all 管理。
+
+**自动联动（零配置兜底）**：未安装 hooks 时，宠物每 3s 监视 pi/claude/codex 等进程树 CPU——活跃即 `working`（蓝点+陪读），静止 12s 转 `thinking`（黄点，等模型响应），
 进程退出且曾活跃 → `done` 庆祝。手动设置的 warning/error/confirm 不被自动逻辑覆盖。
 
 ## 外部控制 socket

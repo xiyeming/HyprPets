@@ -251,6 +251,8 @@ struct App {
     agent_watch_init: bool,
     /// agent 无 CPU 活动起始时间
     agent_quiet_since: Option<Instant>,
+    /// 最近一次 hooks/手动推送时间（推送优先，自动监视暂停 150s）
+    last_hook_push: Option<Instant>,
     agent_watch_acc: f32,
     /// 系统托盘句柄
     tray_handle: Option<ksni::blocking::Handle<tray::PetTray>>,
@@ -717,6 +719,12 @@ impl App {
 
     /// 自动 agent 监视：CPU 活跃 → working；安静 → thinking/清除；退出 → done
     fn update_agent_watch(&mut self) {
+        // hooks/手动推送优先：推送后 150s 内自动监视让位
+        if let Some(t) = self.last_hook_push {
+            if t.elapsed() < std::time::Duration::from_secs(150) {
+                return;
+            }
+        }
         const WATCH_COMMS: [&str; 7] = ["pi", "claude", "codex", "cursor-agent", "gemini", "opencode", "copilot"];
         /// 新启动进程：3s 窗内 ≥1.0s CPU（33%）= 活跃（构建/工具运行 easily 达到）
         const ACTIVE_TICKS: u64 = 100;
@@ -1078,6 +1086,9 @@ impl App {
             }
         };
         self.agent_status_auto = auto;
+        if !auto {
+            self.last_hook_push = Some(Instant::now());
+        }
         let (sound, action, default_text, color) = match kind {
             StatusKind::Thinking => ("pop", "study", "🤔 思考中…", 0xFFF5C966u32),
             StatusKind::Working => ("pop", "study", "⚙️ 工作中…", 0xFF6AA6FF),
@@ -2808,6 +2819,8 @@ fn main() -> Result<()> {
     match raw.first().map(|s| s.as_str()) {
         Some("mcp") => std::process::exit(cli::mcp_main(&raw[1..])),
         Some("char") | Some("character") | Some("pet") => std::process::exit(cli::char_main(&raw[1..])),
+        Some("hook") => std::process::exit(cli::hook_main(&raw[1..])),
+        Some("notify") => std::process::exit(cli::notify_main(&raw[1..])),
         _ => {}
     }
     let args = parse_args();
@@ -2895,6 +2908,7 @@ fn main() -> Result<()> {
         agent_watch: Vec::new(),
         agent_watch_init: false,
         agent_quiet_since: None,
+        last_hook_push: None,
         agent_watch_acc: 0.0,
         behavior: BehaviorConfig::load(),
         seat: None,

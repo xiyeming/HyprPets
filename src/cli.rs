@@ -35,6 +35,7 @@ pub fn mcp_main(args: &[String]) -> i32 {
         "serve" => crate::mcp_serve::serve(),
         "setup" => cmd_setup(args.get(1).map(|s| s.as_str()).unwrap_or("")),
         "export" => cmd_export(args.get(1).map(|s| s.as_str()).unwrap_or("all")),
+        "notify" => notify_main(args.get(1..).unwrap_or(&[])),
         _ => {
             usage();
             2
@@ -704,5 +705,207 @@ fn char_remove(name: &str) -> i32 {
     match std::fs::remove_dir_all(&dir) {
         Ok(_) => { println!("已删除 [{name}]"); 0 }
         Err(e) => { eprintln!("删除失败: {e}"); 1 }
+    }
+}
+
+
+// ===================== hyprpet hook / notify：agent 生命周期 hooks =====================
+
+/// 把事件映射为宠物状态并写入控制 socket
+pub fn notify_main(args: &[String]) -> i32 {
+    let Some(agent) = args.first().map(|s| s.as_str()) else {
+        eprintln!("用法: hyprpet notify <agent> <事件参数...>（由 hooks 自动调用）");
+        return 2;
+    };
+    let state = match agent {
+        "claude" => {
+            // claude 传事件名参数
+            match args.get(1).map(|s| s.as_str()).unwrap_or("") {
+                "session_start" => "idle",
+                "user_prompt_submit" => "thinking",
+                "pre_tool_use" | "post_tool_use" => "working",
+                "stop" => "done",
+                "notification" => "confirm",
+                _ => return 0,
+            }
+        }
+        "codex" => {
+            // codex 把 JSON 作为最后参数追加：{"type":"agent-turn-complete",...}
+            if args.iter().any(|a| a.contains("agent-turn-complete")) {
+                "done"
+            } else {
+                return 0;
+            }
+        }
+        _ => return 0,
+    };
+    // 一连接一命令写 socket
+    let sock = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("hyprpet.sock");
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(sock) {
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+        use std::io::Write as _;
+        let _ = stream.write_all(format!("state {state}\n").as_bytes());
+    }
+    0
+}
+
+
+pub fn hook_main(args: &[String]) -> i32 {
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        eprintln!("用法:\n  hyprpet hook install [all|pi|claude-code|codex]\n  hyprpet hook uninstall [同上]\n  hyprpet hook list");
+        return 2;
+    };
+    let target = args.get(1).map(|s| s.as_str()).unwrap_or("all");
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "hyprpet".into());
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+
+    match sub {
+        "list" => {
+            println!("pi:          {}", home.join(".pi/agent/extensions/hyprpet.mjs").exists());
+            println!("claude-code: {}", home.join(".claude/settings.json").exists().then(|| {
+                std::fs::read_to_string(home.join(".claude/settings.json")).ok().map(|s| s.contains("hyprpet notify claude")).unwrap_or(false)
+            }).unwrap_or(false));
+            println!("codex:       {}", std::fs::read_to_string(home.join(".codex/config.toml")).ok().map(|s| s.contains("hyprpet\" notify")).unwrap_or(false));
+            0
+        }
+        "install" => {
+            let mut code = 0;
+            let do_all = target == "all";
+            let want = |n: &str| do_all || target == n;
+            if want("pi") { code |= hook_pi(&exe, true); }
+            if want("claude-code") { code |= hook_claude(&exe, &home, true); }
+            if want("codex") { code |= hook_codex(&exe, &home, true); }
+            code
+        }
+        "uninstall" => {
+            let mut code = 0;
+            let do_all = target == "all";
+            let want = |n: &str| do_all || target == n;
+            if want("pi") { code |= hook_pi(&exe, false); }
+            if want("claude-code") { code |= hook_claude(&exe, &home, false); }
+            if want("codex") { code |= hook_codex(&exe, &home, false); }
+            code
+        }
+        _ => { eprintln!("未知子命令 {sub}"); 2 }
+    }
+}
+
+fn hook_pi(exe: &str, install: bool) -> i32 {
+    let _ = exe;
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let path = home.join(".pi/agent/extensions/hyprpet.mjs");
+    if !install {
+        return if std::fs::remove_file(&path).is_ok() { println!("已卸载 {}", path.display()); 0 } else { 0 };
+    }
+    if let Some(p) = path.parent() { std::fs::create_dir_all(p).ok(); }
+    let ext = r#"// hyprpet 桌面宠物联动（hyprpet hook install pi 生成）
+import net from "node:net";
+import os from "node:os";
+
+function notify(state, msg) {
+  try {
+    const sock = net.connect(
+      `${process.env.XDG_RUNTIME_DIR ?? `/run/user/${os.userInfo().uid}`}/hyprpet.sock`
+    );
+    sock.on("connect", () => {
+      sock.write(`state ${state}${msg ? " " + msg : ""}\n`);
+      sock.end();
+    });
+    sock.on("error", () => {});
+  } catch {}
+}
+
+export default function (pi) {
+  pi.on("before_agent_start", () => notify("working", "pi 工作中"));
+  pi.on("turn_end", () => notify("done", "pi 任务完成"));
+}
+"#;
+    backup(&path);
+    match std::fs::write(&path, ext) {
+        Ok(_) => { println!("已安装 pi 扩展: {}", path.display()); 0 }
+        Err(e) => { eprintln!("写入失败: {e}"); 1 }
+    }
+}
+
+fn hook_claude(exe: &str, home: &std::path::Path, install: bool) -> i32 {
+    let path = home.join(".claude/settings.json");
+    let marker = format!("{exe} notify claude");
+    let mut v: serde_json::Value = std::fs::read_to_string(&path).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::json!({}));
+    if !v.get("hooks").map(|h| h.is_object()).unwrap_or(false) {
+        v["hooks"] = serde_json::json!({});
+    }
+    let events = [
+        ("SessionStart", "session_start"),
+        ("UserPromptSubmit", "user_prompt_submit"),
+        ("PreToolUse", "pre_tool_use"),
+        ("PostToolUse", "post_tool_use"),
+        ("Stop", "stop"),
+        ("Notification", "notification"),
+    ];
+    let hooks = v["hooks"].as_object_mut().unwrap();
+    for (ev, hypr_ev) in events {
+        let entry = serde_json::json!({
+            "hooks": [{ "type": "command", "command": format!("{exe} notify claude {hypr_ev}") }]
+        });
+        let arr = hooks.entry(ev.to_string()).or_insert_with(|| serde_json::json!([]));
+        if install {
+            if let Some(a) = arr.as_array_mut() {
+                if !serde_json::to_string(a).unwrap_or_default().contains(&marker) {
+                    a.push(entry);
+                }
+            }
+        } else if let Some(a) = arr.as_array_mut() {
+            a.retain(|group| {
+                !group["hooks"].as_array().map(|hs| hs.iter().any(|h| h["command"].as_str().map(|c| c.contains(&marker)).unwrap_or(false))).unwrap_or(false)
+            });
+        }
+    }
+    if !install {
+        // 清理空事件组
+        hooks.retain(|_, group| group.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    }
+    match serde_json::to_string_pretty(&v) {
+        Ok(out) => {
+            backup(&path);
+            match std::fs::write(&path, out) {
+                Ok(_) => { println!("claude-code hooks 已{}", if install { "安装" } else { "卸载" }); 0 }
+                Err(e) => { eprintln!("写入失败: {e}"); 1 }
+            }
+        }
+        Err(e) => { eprintln!("序列化失败: {e}"); 1 }
+    }
+}
+
+fn hook_codex(exe: &str, home: &std::path::Path, install: bool) -> i32 {
+    let path = home.join(".codex/config.toml");
+    let mut v: toml::Value = std::fs::read_to_string(&path).ok().and_then(|s| s.parse().ok()).unwrap_or(toml::Value::Table(toml::map::Map::new()));
+    if install {
+        toml_set(&mut v, &["notify"], toml::Value::Array(vec![
+            toml::Value::String(exe.to_string()),
+            toml::Value::String("notify".into()),
+            toml::Value::String("codex".into()),
+        ]));
+    } else if let Some(t) = v.as_table_mut() {
+        // 仅当是我们注册的才移除
+        if let Some(toml::Value::Array(arr)) = t.get("notify") {
+            if arr.iter().any(|x| x.as_str() == Some("notify")) && arr.first().and_then(|x| x.as_str()).map(|s| s.contains("hyprpet")).unwrap_or(false) {
+                t.remove("notify");
+            }
+        }
+    }
+    match toml::to_string_pretty(&v) {
+        Ok(out) => {
+            backup(&path);
+            match std::fs::write(&path, out) {
+                Ok(_) => { println!("codex notify 已{}", if install { "安装" } else { "卸载" }); 0 }
+                Err(e) => { eprintln!("写入失败: {e}"); 1 }
+            }
+        }
+        Err(e) => { eprintln!("序列化失败: {e}"); 1 }
     }
 }
