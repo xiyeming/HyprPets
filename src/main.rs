@@ -149,6 +149,9 @@ struct AgentStatus {
     #[allow(dead_code)]
     text: String,
     since: Instant,
+    /// confirm 提醒：已重响次数 + 上次提醒时间
+    chimes: u32,
+    last_prompt: Instant,
 }
 
 /// 客户端键盘自动重复状态（合成器/fcitx5 不发重复事件时本地驱动）
@@ -251,6 +254,8 @@ struct App {
     agent_watch_init: bool,
     /// agent 无 CPU 活动起始时间
     agent_quiet_since: Option<Instant>,
+    /// confirm 状态点闪烁相位
+    confirm_dot_phase: bool,
     /// 最近一次 hooks/手动推送时间（推送优先，自动监视暂停 150s）
     last_hook_push: Option<Instant>,
     agent_watch_acc: f32,
@@ -1107,7 +1112,7 @@ impl App {
                 until: Instant::now() + std::time::Duration::from_secs(4),
             });
         }
-        self.agent_status = Some(AgentStatus { kind, text: text.to_string(), since: Instant::now() });
+        self.agent_status = Some(AgentStatus { kind, text: text.to_string(), since: Instant::now(), chimes: 0, last_prompt: Instant::now() });
         self.needs_redraw = true;
     }
 
@@ -1435,6 +1440,7 @@ impl App {
         let font = self.font.as_ref();
         let evade = self.evading();
         let flip_y = self.pet_flip_y();
+        let self_confirm_phase = self.confirm_dot_phase;
         let pet = &self.pet;
         let debug_fill = self.debug_fill;
         let mon_rect = self.monitor_rect_of(pet.x + pet.width_px() / 2);
@@ -1468,8 +1474,11 @@ impl App {
                             pixels, buf_w, vp, rect, (pet.x, pet.y), pet.scale, alpha, flip_y,
                         );
                     }
-                    // agent 状态点（头顶右上）
+                    // agent 状态点（头顶右上）；confirm 时闪烁
                     if let Some(st) = agent_status {
+                        if st.kind == StatusKind::Confirm && !self_confirm_phase {
+                            let _ = (st, agent_status);
+                        } else {
                         let dot = 10i32;
                         let dx = pet.x + pet.width_px() - dot;
                         let dy = pet.y - dot - 4;
@@ -1483,6 +1492,7 @@ impl App {
                         };
                         fill_rect(pixels, buf_w, vp, (dx, dy, dot as u32, dot as u32), color);
                         stroke_rect(pixels, buf_w, vp, (dx, dy, dot as u32, dot as u32), 0xFF20242Fu32);
+                        }
                     }
                     if let (Some(b), Some(f), Some(mr)) = (bubble, font, mon_rect) {
                         ui::draw_bubble(
@@ -1537,6 +1547,28 @@ impl App {
         if let Some(st) = &self.agent_status {
             if st.kind == StatusKind::Done && st.since.elapsed() > std::time::Duration::from_secs(6) {
                 self.clear_agent_status();
+            }
+        }
+
+        // 等待确认：每 15s 重响重提醒（最多 3 次），状态点 1s 周期闪烁抓注意
+        if let Some(st) = &mut self.agent_status {
+            if st.kind == StatusKind::Confirm {
+                if st.chimes < 3 && st.last_prompt.elapsed() >= std::time::Duration::from_secs(15) {
+                    st.chimes += 1;
+                    st.last_prompt = Instant::now();
+                    let text = st.text.clone();
+                    audio::play_named(&self.audio, "confirm");
+                    self.bubble = Some(Bubble {
+                        text: text.chars().take(60).collect(),
+                        until: Instant::now() + std::time::Duration::from_secs(4),
+                    });
+                    self.needs_redraw = true;
+                }
+                let phase = (st.since.elapsed().as_millis() / 500) % 2 == 0;
+                if phase != self.confirm_dot_phase {
+                    self.confirm_dot_phase = phase;
+                    self.needs_redraw = true;
+                }
             }
         }
 
@@ -1941,7 +1973,20 @@ impl App {
                                 self.mini_hide();
                                 continue;
                             }
-                            // 触摸：单击抚摸 → petted（角色缺失该动作则静默回落）
+                            // 触摸：单击抚摸；等待确认时单击 = 确认
+                            if !moved
+                                && !self.pet.is_mini()
+                                && !self.physics.active
+                                && matches!(self.agent_status.as_ref().map(|s| s.kind), Some(StatusKind::Confirm))
+                            {
+                                self.clear_agent_status();
+                                self.bubble = Some(Bubble {
+                                    text: "✓ 已确认".into(),
+                                    until: Instant::now() + std::time::Duration::from_secs(2),
+                                });
+                                self.needs_redraw = true;
+                                continue;
+                            }
                             if !moved && !self.pet.is_mini() && !self.physics.active {
                                 petted = self.set_action("petted");
                                 if petted {
@@ -2908,6 +2953,7 @@ fn main() -> Result<()> {
         agent_watch: Vec::new(),
         agent_watch_init: false,
         agent_quiet_since: None,
+        confirm_dot_phase: true,
         last_hook_push: None,
         agent_watch_acc: 0.0,
         behavior: BehaviorConfig::load(),
