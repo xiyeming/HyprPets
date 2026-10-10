@@ -298,7 +298,7 @@ pub fn scan_characters() -> Vec<(String, PathBuf)> {
 }
 
 /// 内置角色内容版本：结构变化时 +1，已生成的旧版本会被重写
-const BUILTIN_VERSION: u32 = 2;
+const BUILTIN_VERSION: u32 = 3;
 
 fn builtin_needs_refresh(dir: &Path) -> bool {
     if !dir.join("actions.toml").exists() {
@@ -347,7 +347,7 @@ pub fn ensure_builtin_character() -> Result<PathBuf> {
 }
 
 const BUILTIN_META: &str = r#"
-version = 2
+version = 3
 name = "像素小猫"
 author = "hyprpet"
 scale = 4
@@ -438,10 +438,10 @@ next = "idle"
 
 # 陪读/打字（检测到编码进程）→ idle
 [actions.study]
-fps = 4
+fps = 6
 loop = true
 duration = 12
-frames = [[3, 3], [4, 3]]
+frames = [[4, 1], [5, 1], [6, 1], [7, 1]]
 next = "idle"
 
 # 被点击（开心）→ idle
@@ -453,7 +453,7 @@ next = "idle"
 "#;
 
 const SLIME_META: &str = r#"
-version = 2
+version = 3
 name = "像素史莱姆"
 author = "hyprpet"
 scale = 4

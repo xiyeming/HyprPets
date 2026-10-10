@@ -44,6 +44,8 @@ struct Pose {
     eye_shift: i32,
     zzz: bool,
     sweat: bool,
+    /// 敲键盘：bit0=左手抬起 bit1=右手抬起
+    typing: u8,
 }
 
 impl Default for Pose {
@@ -56,6 +58,7 @@ impl Default for Pose {
             eye_shift: 0,
             zzz: false,
             sweat: false,
+            typing: 0,
         }
     }
 }
@@ -139,6 +142,21 @@ fn paint_slime(cell: &mut [u32], pose: Pose) {
     c.set(cx - 1, ey + 4, DARK);
     c.set(cx, ey + 4, DARK);
 
+    // 键盘（工作中）：前置键盘 + 两只小手交替敲击
+    if pose.typing > 0 {
+        c.rect(6, 24, 26, 29, p(255, 58, 64, 78));
+        c.rect(7, 25, 25, 26, p(255, 96, 104, 126));
+        for kx in [9, 13, 17, 21] {
+            c.rect(kx, 25, kx + 1, 26, p(255, 140, 148, 170));
+        }
+        let up_l = (pose.typing & 1 != 0) as i32;
+        let up_r = (pose.typing & 2 != 0) as i32;
+        c.rect(9, 20 + up_l, 13, 24 + up_l, BODY);
+        c.rect(19, 20 + up_r, 23, 24 + up_r, BODY);
+        c.rect(10, 23 + up_l, 12, 24 + up_l, BODY_HI);
+        c.rect(20, 23 + up_r, 22, 24 + up_r, BODY_HI);
+    }
+
     // Zzz
     if pose.zzz {
         c.rect(24, 3, 27, 4, ZZZ);
@@ -196,6 +214,12 @@ pub fn build_sheet() -> Sheet {
     for (i, pose) in walk.iter().enumerate() {
         paint_frame(&mut px, i as u32, 1, *pose);
     }
+    // Row1 空位：敲键盘相位
+    paint_frame(&mut px, 4, 1, Pose { typing: 1, ..Default::default() });
+    paint_frame(&mut px, 5, 1, Pose { typing: 2, ..Default::default() });
+    paint_frame(&mut px, 6, 1, Pose { typing: 3, ..Default::default() });
+    paint_frame(&mut px, 7, 1, Pose { typing: 2, ..Default::default() });
+
     // Row2: 向右走（镜像）
     for (i, pose) in walk.iter().enumerate() {
         paint_frame(&mut px, i as u32, 2, Pose { flip: true, ..*pose });

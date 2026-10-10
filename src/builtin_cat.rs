@@ -44,6 +44,8 @@ struct Pose {
     legs: u8,
     tail_up: bool,
     zzz: bool,
+    /// 敲键盘：bit0=左爪抬起 bit1=右爪抬起
+    typing: u8,
 }
 
 impl Default for Pose {
@@ -56,6 +58,7 @@ impl Default for Pose {
             legs: 1,
             tail_up: false,
             zzz: false,
+            typing: 0,
         }
     }
 }
@@ -129,6 +132,21 @@ fn paint_cat(cell: &mut [u32], stride: u32, pose: Pose) {
         c.rect(21 + leg_b, leg_y, 26 + leg_b, 27, FUR_DARK);
         c.rect(7 + leg_a, 25, 10 + leg_a, 27, PINK);
         c.rect(22 + leg_b, 25, 25 + leg_b, 27, PINK);
+    }
+
+    // 键盘（工作中）：底座+按键，双爪交替起落
+    if pose.typing > 0 {
+        c.rect(7, 25, 25, 29, p(255, 58, 64, 78));
+        c.rect(8, 26, 24, 27, p(255, 96, 104, 126));
+        for kx in [10, 13, 16, 19] {
+            c.rect(kx, 26, kx + 1, 27, p(255, 140, 148, 170));
+        }
+        let up_l = (pose.typing & 1 != 0) as i32;
+        let up_r = (pose.typing & 2 != 0) as i32;
+        c.rect(10, 22 + d - up_l, 14, 26 + d - up_l, FUR);
+        c.rect(18, 22 + d - up_r, 22, 26 + d - up_r, FUR);
+        c.rect(11, 25 - up_l, 13, 26 - up_l, PINK);
+        c.rect(19, 25 - up_r, 21, 26 - up_r, PINK);
     }
 
     // 眼睛
@@ -230,6 +248,12 @@ pub fn build_sheet() -> Sheet {
     for (i, pose) in walk.iter().enumerate() {
         paint_frame(&mut px, i as u32, 1, *pose);
     }
+
+    // Row1 空位：敲键盘相位
+    paint_frame(&mut px, 4, 1, Pose { typing: 1, ..Default::default() });
+    paint_frame(&mut px, 5, 1, Pose { typing: 2, ..Default::default() });
+    paint_frame(&mut px, 6, 1, Pose { typing: 3, ..Default::default() });
+    paint_frame(&mut px, 7, 1, Pose { typing: 2, ..Default::default() });
 
     // Row2: 向右走 = Row1 镜像
     for (i, pose) in walk.iter().enumerate() {
