@@ -245,7 +245,10 @@ struct App {
     /// 状态是否为自动监视设置（手动 warning/error/confirm 不被自动逻辑覆盖）
     agent_status_auto: bool,
     /// 受监视 agent 进程树 CPU 采样
-    agent_watch: Vec<(u32, String, u64, bool)>,  // (pid, name, 累计ticks, 上轮活跃)
+    /// (pid, name, 累计ticks, 上轮活跃, 启动前已存在=常驻)
+    agent_watch: Vec<(u32, String, u64, bool, bool)>,
+    /// 首次采样只做基线快照（区分常驻进程），不驱动状态
+    agent_watch_init: bool,
     /// agent 无 CPU 活动起始时间
     agent_quiet_since: Option<Instant>,
     agent_watch_acc: f32,
@@ -715,7 +718,11 @@ impl App {
     /// 自动 agent 监视：CPU 活跃 → working；安静 → thinking/清除；退出 → done
     fn update_agent_watch(&mut self) {
         const WATCH_COMMS: [&str; 7] = ["pi", "claude", "codex", "cursor-agent", "gemini", "opencode", "copilot"];
-        const ACTIVE_TICKS: u64 = 30; // 3s 采样窗内 ≥0.3s CPU = 活跃（node 空闲轮询通常 0.05~0.2s，避开误报）
+        /// 新启动进程：3s 窗内 ≥1.0s CPU（33%）= 活跃（构建/工具运行 easily 达到）
+        const ACTIVE_TICKS: u64 = 100;
+        /// 宠物启动前已存在的常驻进程（如 Codex 桌面后台）：≥2.0s CPU（66%）才认定
+        /// 真正开始工作，过滤桌面端后台噪音
+        const EXISTING_ACTIVE_TICKS: u64 = 200;
 
         // 发现受监视进程
         let mut found: Vec<(u32, String)> = Vec::new();
@@ -734,8 +741,17 @@ impl App {
             }
         }
 
+        // 首次采样：只做基线，标记常驻进程，不驱动状态
+        if !self.agent_watch_init {
+            self.agent_watch_init = true;
+            for (pid, name) in found {
+                self.agent_watch.push((pid, name, Self::tree_ticks(pid), false, true));
+            }
+            return;
+        }
+
         // 进程消失且曾活跃 → done 庆祝（仅当当前是自动状态）
-        let gone_active = self.agent_watch.iter().any(|(pid, _, _, was_active)| {
+        let gone_active = self.agent_watch.iter().any(|(pid, _, _, was_active, _)| {
             *was_active && !found.iter().any(|(p, _)| p == pid)
         });
         if gone_active && self.agent_status_auto
@@ -744,22 +760,23 @@ impl App {
         {
             self.set_agent_status_ex("done", "", true, true);
         }
-        self.agent_watch.retain(|(pid, _, _, _)| found.iter().any(|(p, _)| p == pid));
+        self.agent_watch.retain(|(pid, _, _, _, _)| found.iter().any(|(p, _)| p == pid));
 
         // 新发现的进程加入监视（下轮采样才有 delta）
         for (pid, name) in &found {
-            if !self.agent_watch.iter().any(|(p, _, _, _)| p == pid) {
-                self.agent_watch.push((*pid, name.clone(), Self::tree_ticks(*pid), false));
+            if !self.agent_watch.iter().any(|(p, _, _, _, _)| p == pid) {
+                self.agent_watch.push((*pid, name.clone(), Self::tree_ticks(*pid), false, false));
             }
         }
 
-        // 更新 ticks
+        // 更新 ticks（常驻进程用更高阈值）
         let mut any_active = false;
-        for (pid, _, ticks, active) in &mut self.agent_watch {
+        for (pid, _, ticks, active, pre_existing) in &mut self.agent_watch {
             let now_ticks = Self::tree_ticks(*pid);
             let delta = now_ticks.saturating_sub(*ticks);
             *ticks = now_ticks;
-            *active = delta >= ACTIVE_TICKS;
+            let threshold = if *pre_existing { EXISTING_ACTIVE_TICKS } else { ACTIVE_TICKS };
+            *active = delta >= threshold;
             any_active |= *active;
         }
 
@@ -2854,6 +2871,7 @@ fn main() -> Result<()> {
         agent_status: None,
         agent_status_auto: false,
         agent_watch: Vec::new(),
+        agent_watch_init: false,
         agent_quiet_since: None,
         agent_watch_acc: 0.0,
         behavior: BehaviorConfig::load(),
