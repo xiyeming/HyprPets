@@ -151,7 +151,10 @@ jobs:
           chmod +x linuxdeploy-x86_64.AppImage
           ARCH=x86_64 VERSION="$VER" ./linuxdeploy-x86_64.AppImage \
             --appimage-extract-and-run --appdir AppDir --output appimage
-          mv hyprpet-*.AppImage "hyprpet-${VER}-x86_64.AppImage"
+          f=$(ls hyprpet-*.AppImage 2>/dev/null | head -1)
+          if [ -n "$f" ] && [ "$f" != "hyprpet-${VER}-x86_64.AppImage" ]; then
+            mv "$f" "hyprpet-${VER}-x86_64.AppImage"
+          fi
 
       # ---------- 校验与发布 ----------
       - name: 生成校验和
