@@ -796,29 +796,33 @@ pub fn hook_main(args: &[String]) -> i32 {
 fn hook_pi(exe: &str, install: bool) -> i32 {
     let _ = exe;
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    let path = home.join(".pi/agent/extensions/hyprpet.mjs");
+    let path = home.join(".pi/agent/extensions/hyprpet.ts");
+    let old = home.join(".pi/agent/extensions/hyprpet.mjs");
     if !install {
+        let _ = std::fs::remove_file(&old);
         return if std::fs::remove_file(&path).is_ok() { println!("已卸载 {}", path.display()); 0 } else { 0 };
     }
+    let _ = std::fs::remove_file(&old);
     if let Some(p) = path.parent() { std::fs::create_dir_all(p).ok(); }
     let ext = r#"// hyprpet 桌面宠物联动（hyprpet hook install pi 生成）
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import net from "node:net";
-import os from "node:os";
 
-function notify(state, msg) {
+function notify(state: string, msg?: string) {
   try {
-    const sock = net.connect(
-      `${process.env.XDG_RUNTIME_DIR ?? `/run/user/${os.userInfo().uid}`}/hyprpet.sock`
-    );
+    const dir = process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`;
+    const sock = net.connect(`${dir}/hyprpet.sock`);
     sock.on("connect", () => {
       sock.write(`state ${state}${msg ? " " + msg : ""}\n`);
       sock.end();
     });
     sock.on("error", () => {});
-  } catch {}
+  } catch {
+    // 宠物未运行时静默
+  }
 }
 
-export default function (pi) {
+export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", () => notify("working", "pi 工作中"));
   pi.on("turn_end", () => notify("done", "pi 任务完成"));
 }

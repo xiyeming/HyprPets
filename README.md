@@ -218,7 +218,7 @@ echo "state done 构建成功！"  | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hyprp
 
 典型工作流：任务开始 `status working` → 完成 `status done`（蹦跳庆祝）→ 异常 `status error` → 等你确认 `status confirm`。
 
-**Hooks 精确联动（推荐）**：hyprpet hook install all 一键安装到主流 agent。
+**Hooks 联动（唯一状态通道）**：hyprpet hook install all 一键安装到主流 agent。
 pi 用扩展（~/.pi/agent/extensions/hyprpet.mjs：before_agent_start→working、
 turn_end→done）；claude-code 用 settings.json 六事件 hooks（SessionStart→idle、
 UserPromptSubmit→thinking、Pre/PostToolUse→working、Stop→done、Notification→confirm）；
