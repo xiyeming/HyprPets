@@ -159,6 +159,8 @@ pub struct Menu {
     pub rect: (i32, i32, u32, u32),
     /// 每个条目的行高（layout 时计算，hit/draw 共用）
     row_heights: Vec<i32>,
+    /// 统一预览列宽（所有皮肤项的最大预览宽）
+    preview_col_w: i32,
     pub font: FontKit,
 }
 
@@ -175,16 +177,28 @@ impl Menu {
         font: FontKit,
     ) -> Menu {
         let text_h = font.px() as i32;
-        // 行高按条目类型自适应：换肤行含预览，动作行仅文字，分隔线细条
+        // 行高按**所有皮肤项的最大预览**统一计算（不同角色帧尺寸不同，行高必须一致），
+        // 预览在行内垂直居中
+        let max_preview_h = items
+            .iter()
+            .filter_map(|it| match it {
+                MenuItem::Skin { preview, .. } => Some(preview.frame_h as i32 * PREVIEW_SCALE as i32),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let max_preview_w = items
+            .iter()
+            .filter_map(|it| match it {
+                MenuItem::Skin { preview, .. } => Some(preview.frame_w as i32 * PREVIEW_SCALE as i32),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
         let row_heights: Vec<i32> = items
             .iter()
             .map(|it| match it {
-                MenuItem::Skin { preview, .. } => {
-                    (preview.frame_h as i32 * PREVIEW_SCALE as i32)
-                        .max(text_h)
-                        .max(10)
-                        + ITEM_PAD * 2
-                }
+                MenuItem::Skin { .. } => max_preview_h.max(text_h).max(10) + ITEM_PAD * 2,
                 MenuItem::Action { .. } => (text_h.max(14)) + ITEM_PAD * 2,
                 MenuItem::Separator => 9,
             })
@@ -192,10 +206,8 @@ impl Menu {
         let width = items
             .iter()
             .map(|it| match it {
-                MenuItem::Skin { name, preview, .. } => {
-                    font.text_width(name).round() as i32
-                        + preview.frame_w as i32 * PREVIEW_SCALE as i32
-                        + 16
+                MenuItem::Skin { name, .. } => {
+                    font.text_width(name).round() as i32 + max_preview_w + 16
                 }
                 MenuItem::Action { label, checked, .. } => {
                     font.text_width(label).round() as i32 + if checked.is_some() { 22 } else { 8 }
@@ -215,7 +227,14 @@ impl Menu {
         y = y.clamp(bbox.1, (bbox.3 - height).max(bbox.1));
         let x = anchor.0.clamp(bbox.0, (bbox.2 - width).max(bbox.0));
 
-        Menu { items, hover: None, rect: (x, y, width as u32, height as u32), row_heights, font }
+        Menu {
+            items,
+            hover: None,
+            rect: (x, y, width as u32, height as u32),
+            row_heights,
+            preview_col_w: max_preview_w,
+            font,
+        }
     }
 
     /// 被点击的条目索引（分隔线不可点击）
@@ -272,19 +291,21 @@ impl Menu {
             }
             match item {
                 MenuItem::Skin { name, preview, preview_idx, .. } => {
+                    // 预览按行高垂直居中（帧小的角色不会顶到行首）
+                    let ph = preview.frame_h as i32 * PREVIEW_SCALE as i32;
+                    let py = ry + (item_h - ph) / 2;
                     let frame = preview.frame(*preview_idx);
                     preview.blit_frame(
                         buf,
                         buf_w,
                         viewport,
                         frame,
-                        (mx + BORDER + ITEM_PAD, ry + ITEM_PAD),
+                        (mx + BORDER + ITEM_PAD, py),
                         PREVIEW_SCALE,
                         255,
                         false,
                     );
-                    let text_x =
-                        mx + BORDER + ITEM_PAD + preview.frame_w as i32 * PREVIEW_SCALE as i32 + 8;
+                    let text_x = mx + BORDER + ITEM_PAD + self.preview_col_w + 8;
                     let text_y = ry + (item_h - self.font.px() as i32) / 2;
                     self.font.draw_text(buf, buf_w, viewport, text_x, text_y, name, TEXT);
                     ry += item_h;
