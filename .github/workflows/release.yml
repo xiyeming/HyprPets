@@ -117,6 +117,7 @@ jobs:
           PKG="pacmanroot"
           mkdir -p "$PKG"
           cp -r stage/usr "$PKG/"
+          SIZE=$(du -sb "$PKG/usr" | cut -f1)
           cat > "$PKG/.PKGINFO" <<PKGINFO
           pkgname = hyprpet
           pkgver = ${VER}-1
@@ -124,7 +125,10 @@ jobs:
           url = https://github.com/${GITHUB_REPOSITORY}
           arch = x86_64
           license = MIT
-          depends = wayland, alsa-lib
+          depend = wayland
+          depend = alsa-lib
+          size = ${SIZE}
+          packager = xiyeming <xiyeming@users.noreply.github.com>
           PKGINFO
           (
             cd "$PKG"
