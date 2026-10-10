@@ -811,18 +811,12 @@ impl App {
                         self.agent_quiet_since = Some(Instant::now());
                     } else {
                         // 彻底无进程 → 直接清除
-                        self.agent_status = None;
-                        self.agent_status_auto = false;
-                        self.agent_quiet_since = None;
-                        self.needs_redraw = true;
+                        self.clear_agent_status();
                     }
                 }
                 Some(StatusKind::Thinking) if quiet_for >= 12.0 => {
                     // thinking 再静默 12s（合计 24s 无活动）→ 状态点撤掉
-                    self.agent_status = None;
-                    self.agent_status_auto = false;
-                    self.agent_quiet_since = None;
-                    self.needs_redraw = true;
+                    self.clear_agent_status();
                 }
                 _ => {}
             }
@@ -1032,6 +1026,34 @@ impl App {
         self.sync_tray();
     }
 
+    /// 清除 agent 状态（状态点撤掉 + 回 idle）
+    fn clear_agent_status(&mut self) {
+        if self.agent_status.is_none() {
+            return;
+        }
+        self.agent_status = None;
+        self.agent_status_auto = false;
+        self.agent_quiet_since = None;
+        if self.drag_offset.is_none() && !self.physics.active {
+            self.set_action("idle");
+        }
+        self.needs_redraw = true;
+    }
+
+    /// 工作中：把动作钉在敲键盘（study），直到状态解除；拖拽/抛掷时放行
+    fn pin_working_action(&mut self) {
+        if self.drag_offset.is_some() || self.physics.active {
+            return;
+        }
+        if let Some(st) = &self.agent_status {
+            if st.kind == StatusKind::Working
+                && self.fsm.as_ref().map(|f| f.current.as_str()) != Some("study")
+            {
+                self.set_action("study");
+            }
+        }
+    }
+
     /// agent 状态联动：状态点 + 动作 + 音效 + 气泡
     fn set_agent_status(&mut self, kind_str: &str, text: &str) {
         self.set_agent_status_ex(kind_str, text, true, false);
@@ -1047,8 +1069,7 @@ impl App {
             "error" | "fail" | "exception" => StatusKind::Error,
             "confirm" | "ask" => StatusKind::Confirm,
             "idle" | "clear" | "" => {
-                self.agent_status = None;
-                self.needs_redraw = true;
+                self.clear_agent_status();
                 return;
             }
             other => {
@@ -1504,11 +1525,12 @@ impl App {
         // agent「完成」状态自动消退
         if let Some(st) = &self.agent_status {
             if st.kind == StatusKind::Done && st.since.elapsed() > std::time::Duration::from_secs(6) {
-                self.agent_status = None;
-                self.agent_status_auto = false;
-                self.needs_redraw = true;
+                self.clear_agent_status();
             }
         }
+
+        // 工作中：持续敲键盘（study 12s 会转移 idle，这里钉住直到状态解除）
+        self.pin_working_action();
 
         // agent 进程自动监视（3s 采样，独立于感知冷却）
         self.agent_watch_acc += dt;
