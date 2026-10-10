@@ -13,6 +13,7 @@ mod agent;
 mod assets;
 mod audio;
 mod builtin_cat;
+mod builtin_girl;
 mod builtin_slime;
 mod chat;
 mod cli;
@@ -2777,6 +2778,7 @@ fn main() -> Result<()> {
     // 首次运行写入内置角色与提示音
     let builtin_dir = assets::ensure_builtin_character().context("初始化内置角色失败")?;
     assets::ensure_builtin_slime().context("初始化内置史莱姆失败")?;
+    assets::ensure_builtin_girl().context("初始化内置少女失败")?;
     audio::ensure_builtin_sounds();
 
     // 读取上次状态（角色 / 模式 / 位置）
